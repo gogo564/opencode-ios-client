@@ -36,7 +36,7 @@ final class OpenCodeClient {
             request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 30
         return request
     }
@@ -153,10 +153,12 @@ final class OpenCodeClient {
         }
     }
 
-    /// GET /session/:id/message 获取会话消息列表（按时间升序）
-    func messages(sessionID: String, limit: Int? = nil) async throws -> [OCMessage] {
+    /// GET /session/:id/message 获取会话消息列表（按时间升序）。
+    /// limit 为最近消息数（不含历史），before 为从某条消息之前继续分页（均可选）。
+    func messages(sessionID: String, limit: Int? = nil, before: String? = nil) async throws -> [OCMessage] {
         var query: [URLQueryItem] = []
         if let limit { query.append(URLQueryItem(name: "limit", value: String(limit))) }
+        if let before { query.append(URLQueryItem(name: "before", value: before)) }
         let request = try makeRequest("/session/\(sessionID)/message", query: query)
         let (data, response) = try await URLSession.shared.data(for: request)
         try ensureOK(response)
@@ -194,20 +196,19 @@ final class OpenCodeClient {
         let parts: [String]
     }
 
-    /// 发送消息（即时对话）。
-    /// 先用 POST /session/:id/prompt_async 立即提交（204），随后轮询
-    /// GET /session/:id/message 增量读取回复文本，通过 onText 逐段回调，
-    /// 直到 assistant 消息标记完成（time.completed 存在）。
+    /// 发送消息（即时对话，兼容新旧版本服务器）。
+    /// 使用 POST /session/:id/message 并流式读取响应：
+    /// - 现代版本返回单段 JSON {info, parts}
+    /// - 旧版本返回 SSE 事件流（text/event-stream），逐块回调文本
+    /// 两种都支持，保证一定能收到回复。
     func sendMessage(
         sessionID: String,
         text: String,
         model: OCModel? = nil,
         onText: @escaping (String) -> Void = { _ in }
     ) async throws -> OCSendResult {
-        let messageID = "msg_" + UUID().uuidString.lowercased()
-        var request = try makeRequest("/session/\(sessionID)/prompt_async", method: "POST")
+        var request = try makeRequest("/session/\(sessionID)/message", method: "POST")
         var body: [String: Any] = [
-            "messageID": messageID,
             "parts": [
                 ["type": "text", "text": text]
             ]
@@ -217,57 +218,122 @@ final class OpenCodeClient {
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 60
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 600
 
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         try ensureOK(response)
 
-        return try await pollForReply(sessionID: sessionID, messageID: messageID, text: text, onText: onText)
-    }
+        var accumulated = ""
+        var fullJSON = ""
 
-    /// 轮询消息列表，直到出现本轮用户消息之后 assistant 的完整回复。
-    /// 优先按自定义 messageID 定位；若服务器不保存该 ID（旧版本），回退按文本匹配最新用户消息。
-    private func pollForReply(
-        sessionID: String,
-        messageID: String,
-        text: String,
-        onText: @escaping (String) -> Void
-    ) async throws -> OCSendResult {
-        let deadline = Date().addingTimeInterval(300)
-
-        while Date() < deadline {
-            try await Task.sleep(nanoseconds: 900_000_000)
-            let msgs = try await messages(sessionID: sessionID, limit: 20)
-
-            // 定位本轮用户消息：优先 messageID，回退匹配最新一条内容相同的用户消息
-            var userIndex = msgs.firstIndex(where: { $0.id == messageID })
-            if userIndex == nil {
-                userIndex = msgs.lastIndex(where: { $0.role == "user" && $0.content == text })
+        do {
+            for try await line in bytes.lines {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("data:") {
+                    let payload = t.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                    guard !payload.isEmpty, payload != "[DONE]" else { continue }
+                    switch parseEventText(payload) {
+                    case .some(let result):
+                        if !result.full.isEmpty {
+                            accumulated = result.full
+                            onText(accumulated)
+                        } else if !result.delta.isEmpty {
+                            accumulated += result.delta
+                            onText(accumulated)
+                        }
+                    case .none:
+                        break
+                    }
+                } else if t.hasPrefix("{") {
+                    // 可能是不带 data: 前缀的整段 JSON（单段响应），累积拼接供整体解析
+                    if accumulated.isEmpty {
+                        fullJSON += t
+                    }
+                }
             }
-            guard let userIndex else { continue }
-            let suffix = msgs[(userIndex + 1)...]
+        } catch {}
 
-            var replyText = ""
-            var isDone = false
-            for m in suffix where m.role == "assistant" {
-                replyText += m.content
-                if m.completed { isDone = true }
-            }
+        // 1) 若已通过 SSE 拿到文本，直接返回
+        if !accumulated.isEmpty {
+            let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: accumulated, isStreaming: false, error: false, completed: true)
+            return OCSendResult(message: msg, parts: [accumulated])
+        }
 
-            if replyText.isEmpty && !isDone { continue }
-
-            if !replyText.isEmpty {
-                onText(replyText)
-            }
-
-            if isDone && !replyText.isEmpty {
-                let msg = OCMessage(id: "assistant", role: "assistant", content: replyText, isStreaming: false, error: false, completed: true)
-                return OCSendResult(message: msg, parts: [replyText])
+        // 2) 否则尝试整体 JSON {info, parts}
+        if let json = try? JSONSerialization.jsonObject(with: Data(fullJSON.utf8)) as? [String: Any] {
+            if let info = json["info"] as? [String: Any],
+               let mid = info["id"] as? String {
+                let role = info["role"] as? String ?? "assistant"
+                let isError = info["error"] != nil
+                let parts = parseParts(json["parts"] as? [[String: Any]] ?? [])
+                let text = parts.joined()
+                let msg = OCMessage(id: mid, role: role, content: text, isStreaming: false, error: isError, completed: true)
+                return OCSendResult(message: msg, parts: parts)
             }
         }
 
+        // 3) 尝试整段 SSE 文本兜底
+        let sseText = mergeSSELines(fullJSON)
+        if !sseText.isEmpty {
+            let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: sseText, isStreaming: false, error: false, completed: true)
+            return OCSendResult(message: msg, parts: [sseText])
+        }
+
         throw OCError.decoding
+    }
+
+    /// 解析 opencode 事件帧 JSON，提取 assistant 文本。
+    /// -.full: 该 part 的完整文本（覆盖），-.delta: 增量文本（追加）。
+    private func parseEventText(_ payload: String) -> (full: String, delta: String)? {
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] else {
+            return nil
+        }
+        // 新版事件：{ type: "message.part.updated", properties: { part: {…}, delta } }
+        if let properties = obj["properties"] as? [String: Any] {
+            if let part = properties["part"] as? [String: Any] {
+                let type = part["type"] as? String ?? ""
+                if type == "text", let pt = part["text"] as? String, !pt.isEmpty {
+                    return (pt, "")
+                }
+                if type == "error", let error = part["error"] as? String {
+                    return ("[错误] \(error)", "")
+                }
+            }
+            if let delta = properties["delta"] as? String, !delta.isEmpty {
+                return ("", delta)
+            }
+            return nil
+        }
+        // 旧格式：顶层 part/text/content
+        if let part = obj["part"] as? [String: Any], part["type"] as? String == "text", let pt = part["text"] as? String, !pt.isEmpty {
+            return (pt, "")
+        }
+        if let t = obj["text"] as? String, !t.isEmpty { return (t, "") }
+        if let content = obj["content"] as? String, !content.isEmpty { return (content, "") }
+        return nil
+    }
+
+    private func mergeSSELines(_ raw: String) -> String {
+        var out = ""
+        for line in raw.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("data:") else { continue }
+            let payload = t.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard !payload.isEmpty, payload != "[DONE]" else { continue }
+            if let json = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] {
+                if let properties = json["properties"] as? [String: Any],
+                   let part = properties["part"] as? [String: Any],
+                   let pt = part["text"] as? String {
+                    out = pt
+                } else if let pt = json["text"] as? String {
+                    out += pt
+                } else if let pc = json["content"] as? String {
+                    out += pc
+                }
+            }
+        }
+        return out
     }
 
     private func parseParts(_ parts: [[String: Any]]) -> [String] {

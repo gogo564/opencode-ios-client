@@ -8,6 +8,8 @@ struct ChatView: View {
     @State private var messages: [OpenCodeClient.OCMessage] = []
     @State private var input = ""
     @State private var isLoading = false
+    @State private var isLoadingMore = false
+    @State private var hasMoreHistory = true
     @State private var errorMessage: String?
     @State private var isStreaming = false
     @State private var streamingText = ""
@@ -15,6 +17,7 @@ struct ChatView: View {
     @State private var isModelsLoading = false
 
     private let client = OpenCodeClient.shared
+    private let pageSize = 30
 
     var body: some View {
         VStack(spacing: 0) {
@@ -83,6 +86,34 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 12) {
+                    if !hasMoreHistory {
+                        Text("--------- 对话开始 ---------")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.top, 8)
+                    } else {
+                        Button {
+                            Task { await loadOlderMessages() }
+                        } label: {
+                            if isLoadingMore {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("加载更早消息")
+                                    .font(.caption)
+                                    .foregroundColor(.accentColor)
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                    if let errorMessage, errorMessage.isEmpty == false {
+                        Text(errorMessage)
+                            .font(.footnote)
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(Color.red.opacity(0.08))
+                            .cornerRadius(8)
+                    }
                     if messages.isEmpty && !isStreaming {
                         Text("发送消息开始对话")
                             .foregroundColor(.secondary)
@@ -175,11 +206,33 @@ struct ChatView: View {
         isLoading = true
         errorMessage = nil
         do {
-            messages = try await client.messages(sessionID: session.id)
+            let latest = try await client.messages(sessionID: session.id, limit: pageSize)
+            messages = latest
+            hasMoreHistory = latest.count >= pageSize
+            // 加载到更早的历史（如果有），让列表完整
+            await loadOlderMessages()
         } catch {
             errorMessage = error.localizedDescription
         }
         isLoading = false
+    }
+
+    @MainActor
+    private func loadOlderMessages() async {
+        guard hasMoreHistory, !isLoadingMore, let before = messages.first?.id else { return }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+        do {
+            let older = try await client.messages(sessionID: session.id, limit: pageSize, before: before)
+            hasMoreHistory = older.count >= pageSize
+            // 去重合并，保持时间升序（旧的在前）
+            let existing = Set(messages.map { $0.id })
+            let newOnes = older.filter { !existing.contains($0.id) }
+            messages = newOnes + messages
+        } catch {
+            // 静默：可能是没有更早消息了
+            hasMoreHistory = false
+        }
     }
 
     private func send() {
@@ -197,7 +250,7 @@ struct ChatView: View {
             }
             do {
                 let model = availableModels.first { $0.id == config.selectedModel }
-                let result = try await client.sendMessage(
+                _ = try await client.sendMessage(
                     sessionID: session.id,
                     text: text,
                     model: model
@@ -209,8 +262,10 @@ struct ChatView: View {
                 await MainActor.run {
                     isStreaming = false
                     streamingText = ""
-                    messages.append(result.message)
+                    // 以服务器保存的消息为准，重新加载列表（避免本地乐观消息与服务器重复）
+                    messages.removeLast()
                 }
+                await loadMessages()
             } catch {
                 await MainActor.run {
                     isStreaming = false
