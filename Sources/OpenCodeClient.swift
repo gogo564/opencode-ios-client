@@ -149,9 +149,15 @@ final class OpenCodeClient {
         let parts: [String]
     }
 
-    /// POST /session/:id/message 发送消息并等待完整回复。
+    /// POST /session/:id/message 发送消息。
     /// body: { parts: [{ type: "text", text: "..." }] }
-    func sendMessage(sessionID: String, text: String) async throws -> OCSendResult {
+    /// 返回的是 SSE 流，用 bytes(for:) 逐行增量读取，并把已生成的文本通过 onText 回调
+    /// （避免 data(for:) 一直等到流关闭才返回，导致界面长时间转圈）。
+    func sendMessage(
+        sessionID: String,
+        text: String,
+        onText: @escaping (String) -> Void = { _ in }
+    ) async throws -> OCSendResult {
         var request = try makeRequest("/session/\(sessionID)/message", method: "POST")
         let body: [String: Any] = [
             "parts": [
@@ -162,34 +168,36 @@ final class OpenCodeClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 300
-        let (data, response) = try await URLSession.shared.data(for: request)
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         try ensureOK(response)
 
-        // 响应可能是 SSE 流或纯 JSON，先尝试整体解析 JSON
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let info = json["info"] as? [String: Any],
-           let mid = info["id"] as? String {
-            let role = info["role"] as? String ?? "assistant"
-            let parts = parseParts(json["parts"] as? [[String: Any]] ?? [])
-            let msg = OCMessage(id: mid, role: role, content: parts.joined(), isStreaming: false, error: false)
-            return OCSendResult(message: msg, parts: parts)
-        }
+        var lastText = ""
+        do {
+            for try await line in bytes.lines {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                guard t.hasPrefix("data:") else { continue }
+                let payload = t.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                guard !payload.isEmpty, payload != "[DONE]" else { continue }
+                if let json = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] {
+                    if let part = json["part"] as? [String: Any],
+                       let pt = part["text"] as? String {
+                        lastText = pt
+                    } else if let pt = json["text"] as? String {
+                        lastText = lastText.isEmpty ? pt : lastText + pt
+                    } else if let pc = json["content"] as? String {
+                        lastText = lastText.isEmpty ? pc : lastText + pc
+                    }
+                    onText(lastText)
+                }
+            }
+        } catch {}
 
-        // 否则尝试解析 SSE：合并所有 data 行
-        let text = String(data: data, encoding: .utf8) ?? ""
-        let sseParts = parseSSE(text)
-        if !sseParts.isEmpty {
-            let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: sseParts.joined(), isStreaming: false, error: false)
-            return OCSendResult(message: msg, parts: sseParts)
+        guard !lastText.isEmpty else {
+            throw OCError.decoding
         }
-
-        // 最后尝试上游文本
-        let plain = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !plain.isEmpty, plain.hasPrefix("{") == false {
-            let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: plain, isStreaming: false, error: false)
-            return OCSendResult(message: msg, parts: [plain])
-        }
-        throw OCError.decoding
+        let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: lastText, isStreaming: false, error: false)
+        return OCSendResult(message: msg, parts: [lastText])
     }
 
     private func parseParts(_ parts: [[String: Any]]) -> [String] {
@@ -198,28 +206,6 @@ final class OpenCodeClient {
             let type = part["type"] as? String ?? ""
             if type == "text", let t = part["text"] as? String {
                 out.append(t)
-            }
-        }
-        return out
-    }
-
-    private func parseSSE(_ raw: String) -> [String] {
-        var out: [String] = []
-        for line in raw.components(separatedBy: "\n") {
-            guard line.hasPrefix("data:") else { continue }
-            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" { continue }
-            if let json = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] {
-                if let t = json["text"] as? String {
-                    out.append(t)
-                } else if let content = json["content"] as? String {
-                    out.append(content)
-                } else if let info = json["info"] as? [String: Any], let role = info["role"] as? String {
-                    // 忽略信息帧
-                    _ = role
-                }
-            } else {
-                out.append(payload)
             }
         }
         return out

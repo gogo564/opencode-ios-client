@@ -112,7 +112,11 @@ struct ChatView: View {
                 errorMessage = nil
             }
             do {
-                let result = try await client.sendMessage(sessionID: session.id, text: text)
+                let result = try await client.sendMessage(sessionID: session.id, text: text) { chunk in
+                    Task { @MainActor in
+                        streamingText = chunk
+                    }
+                }
                 await MainActor.run {
                     isStreaming = false
                     streamingText = ""
