@@ -15,6 +15,7 @@ struct ChatView: View {
     @State private var streamingText = ""
     @State private var availableModels: [OpenCodeClient.OCModel] = []
     @State private var isModelsLoading = false
+    @State private var pendingCommand: String?
 
     private let client = OpenCodeClient.shared
     private let pageSize = 30
@@ -28,9 +29,62 @@ struct ChatView: View {
         }
         .navigationTitle(session.title ?? "会话")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Menu {
+                    Button("压缩上下文 (/compact)") {
+                        pendingCommand = "/compact"
+                    }
+                    Button("新建会话 (/new)") {
+                        pendingCommand = "/new"
+                    }
+                    Button("清空本会话 (/clear)") {
+                        pendingCommand = "/clear"
+                    }
+                } label: {
+                    Image(systemName: "slider.horizontal.3").accessibilityLabel("会话工具")
+                }
+                .disabled(isStreaming)
+            }
+        }
+        .confirmationDialog(
+            pendingCommandConfirmTitle,
+            isPresented: commandDialogPresented,
+            titleVisibility: .visible
+        ) {
+            Button("确认发送 \(pendingCommand ?? "")", role: .destructive) {
+                sendCommand(pendingCommand ?? "")
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(pendingCommandConfirmMessage)
+        }
         .onAppear {
             Task { await loadInitial() }
         }
+    }
+
+    private var pendingCommandConfirmTitle: String {
+        switch pendingCommand {
+        case "/compact": return "压缩上下文"
+        case "/new": return "新建会话"
+        case "/clear": return "清空本会话"
+        default: return "会话工具"
+        }
+    }
+
+    private var pendingCommandConfirmMessage: String {
+        switch pendingCommand {
+        case "/compact": return "把本会话历史压缩为摘要，保留话题并加快后续回复"
+        case "/new": return "开启全新空白会话，当前会话仍会保留"
+        case "/clear": return "清除本会话全部历史记录"
+        default: return ""
+        }
+    }
+
+    private func sendCommand(_ command: String) {
+        input = command
+        send()
     }
 
     private var modelPicker: some View {
@@ -80,6 +134,13 @@ struct ChatView: View {
 
     private var currentModel: OpenCodeClient.OCModel? {
         availableModels.first { $0.id == config.selectedModel }
+    }
+
+    private var commandDialogPresented: Binding<Bool> {
+        Binding(
+            get: { pendingCommand != nil },
+            set: { if !$0 { pendingCommand = nil } }
+        )
     }
 
     private var messageList: some View {
