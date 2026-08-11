@@ -13,12 +13,16 @@ final class ServerConfig: ObservableObject {
     @Published var password: String {
         didSet { UserDefaults.standard.set(password, forKey: "oc_password") }
     }
+    @Published var selectedModel: String {
+        didSet { UserDefaults.standard.set(selectedModel, forKey: "oc_selectedModel") }
+    }
 
     init() {
         let d = UserDefaults.standard
         baseURL = d.string(forKey: "oc_baseURL") ?? "http://gogo564.x3322.net:4096"
         username = d.string(forKey: "oc_username") ?? "opencode"
         password = d.string(forKey: "oc_password") ?? ""
+        selectedModel = d.string(forKey: "oc_selectedModel") ?? ""
     }
 
     /// 规范化服务器地址：去掉尾部斜杠

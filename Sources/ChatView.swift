@@ -1,27 +1,82 @@
 import SwiftUI
 
-/// 单会话聊天界面。
+/// 单会话聊天界面（即时对话 + 模型选择）。
 struct ChatView: View {
     let session: OpenCodeClient.OCSession
     @EnvironmentObject private var store: SessionStore
+    @EnvironmentObject private var config: ServerConfig
     @State private var messages: [OpenCodeClient.OCMessage] = []
     @State private var input = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var isStreaming = false
     @State private var streamingText = ""
+    @State private var availableModels: [OpenCodeClient.OCModel] = []
+    @State private var isModelsLoading = false
 
     private let client = OpenCodeClient.shared
 
     var body: some View {
         VStack(spacing: 0) {
+            modelPicker
             messageList
             Divider()
             inputBar
         }
         .navigationTitle(session.title ?? "会话")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { Task { await loadMessages() } }
+        .onAppear {
+            Task { await loadInitial() }
+        }
+    }
+
+    private var modelPicker: some View {
+        HStack {
+            if isModelsLoading {
+                ProgressView()
+                    .controlSize(.small)
+                Text("加载模型…")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else if availableModels.isEmpty {
+                Text("当前服务器无可用模型")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else if let selected = currentModel {
+                Text("模型：\(selected.displayName)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Menu {
+                    Picker("选择模型", selection: Binding(
+                        get: { config.selectedModel },
+                        set: { config.selectedModel = $0 }
+                    )) {
+                        ForEach(availableModels) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "chevron.down.circle")
+                        .font(.system(size: 18))
+                }
+            } else {
+                Text("加载模型失败")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("重试") { Task { await loadModels() } }
+                    .font(.caption)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemBackground).opacity(0.5))
+    }
+
+    private var currentModel: OpenCodeClient.OCModel? {
+        availableModels.first { $0.id == config.selectedModel }
     }
 
     private var messageList: some View {
@@ -44,7 +99,8 @@ struct ChatView: View {
                                 role: "assistant",
                                 content: streamingText,
                                 isStreaming: true,
-                                error: false
+                                error: false,
+                                completed: false
                             )
                         )
                         .id("streaming")
@@ -87,6 +143,34 @@ struct ChatView: View {
     }
 
     @MainActor
+    private func loadInitial() async {
+        async let models: Void = loadModelsIfNeeded()
+        async let msgs: Void = loadMessages()
+        _ = await (models, msgs)
+    }
+
+    @MainActor
+    private func loadModelsIfNeeded() async {
+        guard availableModels.isEmpty else { return }
+        await loadModels()
+    }
+
+    @MainActor
+    private func loadModels() async {
+        isModelsLoading = true
+        defer { isModelsLoading = false }
+        do {
+            let list = try await client.models()
+            availableModels = list
+            if config.selectedModel.isEmpty || !list.contains(where: { $0.id == config.selectedModel }) {
+                config.selectedModel = list.first?.id ?? ""
+            }
+        } catch {
+            // 模型列表失败不阻塞聊天
+        }
+    }
+
+    @MainActor
     private func loadMessages() async {
         isLoading = true
         errorMessage = nil
@@ -105,14 +189,19 @@ struct ChatView: View {
         Task {
             await MainActor.run {
                 messages.append(OpenCodeClient.OCMessage(
-                    id: UUID().uuidString, role: "user", content: text, isStreaming: false, error: false
+                    id: UUID().uuidString, role: "user", content: text, isStreaming: false, error: false, completed: true
                 ))
                 isStreaming = true
                 streamingText = ""
                 errorMessage = nil
             }
             do {
-                let result = try await client.sendMessage(sessionID: session.id, text: text) { chunk in
+                let model = availableModels.first { $0.id == config.selectedModel }
+                let result = try await client.sendMessage(
+                    sessionID: session.id,
+                    text: text,
+                    model: model
+                ) { chunk in
                     Task { @MainActor in
                         streamingText = chunk
                     }
@@ -145,7 +234,12 @@ struct MessageBubble: View {
                 Text(message.displayName)
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Text(message.content)
+                if message.error {
+                    Text("回复失败")
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
+                Text(message.content.isEmpty && message.isStreaming ? "…" : message.content)
                     .font(.body)
                     .textSelection(.enabled)
                     .padding(12)
