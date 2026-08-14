@@ -19,8 +19,8 @@ final class ServerConfig: ObservableObject {
 
     init() {
         let d = UserDefaults.standard
-        baseURL = d.string(forKey: "oc_baseURL") ?? "http://gogo564.x3322.net:4096"
-        username = d.string(forKey: "oc_username") ?? "opencode"
+        baseURL = d.string(forKey: "oc_baseURL") ?? ""
+        username = d.string(forKey: "oc_username") ?? ""
         password = d.string(forKey: "oc_password") ?? ""
         selectedModel = d.string(forKey: "oc_selectedModel") ?? ""
     }

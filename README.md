@@ -11,7 +11,7 @@
 
 ## 使用
 
-1. 打开 App，进入设置，填写你的 OpenCode 服务器地址（如 `http://gogo564.x3322.net:4096`）、用户名（默认 `opencode`）和密码（`OPENCODE_SERVER_PASSWORD`）
+1. 打开 App，进入设置，填写你的 OpenCode 服务器地址、用户名和密码（Basic Auth）
 2. 点击"测试连接"验证
 3. 回到会话列表，新建会话并开始对话
 

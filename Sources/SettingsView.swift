@@ -16,7 +16,7 @@ struct SettingsView: View {
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                         .textContentType(.URL)
-                    Text("例如 http://gogo564.x3322.net:4096")
+                    Text("例如 http://192.168.1.100:3000")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
