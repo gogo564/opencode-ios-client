@@ -185,6 +185,26 @@ final class OpenCodeClient {
         let fields: [OCFormField]
     }
 
+    /// prompt 的附件（图片走 data URI，文件走项目内相对路径）
+    struct OCFileAttachment {
+        let uri: String
+        let name: String
+    }
+
+    /// 排队中的消息（delivery = steer / queue）
+    struct OCInboxMessage: Identifiable {
+        let id: String
+        let text: String
+        let delivery: String
+    }
+
+    /// 已保存的「始终允许」规则
+    struct OCSavedPermission: Identifiable {
+        let id: String
+        let action: String
+        let resource: String
+    }
+
     // MARK: - 模型
 
     /// GET /api/model -> { location, data: [Model.Info] }
@@ -246,6 +266,11 @@ final class OpenCodeClient {
     /// DELETE /api/session/{id}
     func deleteSession(_ id: String) async throws {
         _ = try await perform(try makeRequest("/api/session/\(id)", method: "DELETE"))
+    }
+
+    /// PATCH /api/session/{id} { title } —— 重命名
+    func renameSession(sessionID: String, title: String) async throws {
+        _ = try await perform(try makeRequest("/api/session/\(sessionID)", method: "PATCH", body: ["title": title]))
     }
 
     /// 切换会话模型：POST /api/session/{id}/model { model: { id, providerID } }
@@ -339,10 +364,12 @@ final class OpenCodeClient {
         return OCTool(id: id, name: name, status: status, input: inputText, output: output, error: error)
     }
 
-    /// POST /api/session/{id}/prompt { text } -> { data: userMessage }
+    /// POST /api/session/{id}/prompt { text, delivery?, files? } -> { data: userMessage }
     @discardableResult
-    func sendPrompt(sessionID: String, text: String) async throws -> String? {
-        let body: [String: Any] = ["text": text]
+    func sendPrompt(sessionID: String, text: String, delivery: String? = nil, files: [OCFileAttachment] = []) async throws -> String? {
+        var body: [String: Any] = ["text": text]
+        if let delivery, !delivery.isEmpty { body["delivery"] = delivery }
+        if !files.isEmpty { body["files"] = files.map { ["uri": $0.uri, "name": $0.name] } }
         let data = try await perform(try makeRequest("/api/session/\(sessionID)/prompt", method: "POST", body: body))
         let json = try? dictionary(data)
         let message = json?["data"] as? [String: Any]
@@ -352,6 +379,66 @@ final class OpenCodeClient {
     /// POST /api/session/{id}/interrupt
     func interrupt(sessionID: String) async throws {
         _ = try await perform(try makeRequest("/api/session/\(sessionID)/interrupt", method: "POST", body: [:]))
+    }
+
+    // MARK: - 排队消息（inbox）
+
+    /// GET /api/session/{id}/inbox -> { data: [Inbox.Info] }
+    func inbox(sessionID: String) async throws -> [OCInboxMessage] {
+        let data = try await perform(try makeRequest("/api/session/\(sessionID)/inbox"))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        return arr.compactMap { item in
+            guard let id = item["id"] as? String, (item["type"] as? String) == "user" else { return nil }
+            let payload = item["payload"] as? [String: Any] ?? [:]
+            return OCInboxMessage(
+                id: id,
+                text: payload["text"] as? String ?? "",
+                delivery: item["delivery"] as? String ?? "queue"
+            )
+        }
+    }
+
+    /// DELETE /api/session/{id}/inbox/{inboxID}
+    func deleteInbox(sessionID: String, inboxID: String) async throws {
+        _ = try await perform(try makeRequest("/api/session/\(sessionID)/inbox/\(inboxID)", method: "DELETE"))
+    }
+
+    // MARK: - 已保存的授权规则
+
+    /// GET /api/permission/saved
+    func savedPermissions() async throws -> [OCSavedPermission] {
+        let data = try await perform(try makeRequest("/api/permission/saved"))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        return arr.compactMap { item in
+            guard let id = item["id"] as? String else { return nil }
+            return OCSavedPermission(
+                id: id,
+                action: item["action"] as? String ?? "",
+                resource: item["resource"] as? String ?? ""
+            )
+        }
+    }
+
+    /// DELETE /api/permission/saved/{id}
+    func deleteSavedPermission(id: String) async throws {
+        _ = try await perform(try makeRequest("/api/permission/saved/\(id)", method: "DELETE"))
+    }
+
+    // MARK: - 文件搜索（@引用）
+
+    /// GET /api/fs/find?query=&type=file&limit=
+    func findFiles(query: String, limit: Int = 30) async throws -> [String] {
+        let q: [URLQueryItem] = [
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "type", value: "file"),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        let data = try await perform(try makeRequest("/api/fs/find", query: q))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        return arr.compactMap { $0["path"] as? String }
     }
 
     // MARK: - 权限（授权确认）

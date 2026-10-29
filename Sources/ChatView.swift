@@ -5,13 +5,29 @@ import UIKit
 enum ChatSheet: Identifiable {
     case permission(OpenCodeClient.OCPermission)
     case form(OpenCodeClient.OCForm)
+    case rename
+    case photo
+    case camera
+    case files
 
     var id: String {
         switch self {
         case .permission(let p): return "p-\(p.id)"
         case .form(let f): return "f-\(f.id)"
+        case .rename: return "rename"
+        case .photo: return "photo"
+        case .camera: return "camera"
+        case .files: return "files"
         }
     }
+}
+
+/// 待发送的附件（图片以 data URI 提交）
+struct PendingAttachment: Identifiable {
+    let id = UUID()
+    let name: String
+    let uri: String
+    let preview: UIImage?
 }
 
 /// 单会话聊天界面（V2：prompt + /api/event 事件流 + 权限/表单弹窗）。
@@ -33,6 +49,8 @@ struct ChatView: View {
     @State private var activeSheet: ChatSheet?
     @State private var dismissedPermissionIDs: Set<String> = []
     @State private var dismissedFormIDs: Set<String> = []
+    @State private var queued: [OpenCodeClient.OCInboxMessage] = []
+    @State private var attachments: [PendingAttachment] = []
     @State private var title: String
     @State private var pollTask: Task<Void, Never>?
 
@@ -54,6 +72,15 @@ struct ChatView: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button {
+                    activeSheet = .rename
+                } label: {
+                    Image(systemName: "pencil")
+                }
+            }
+        }
         .onAppear { start() }
         .onDisappear {
             stream.stop()
@@ -183,29 +210,138 @@ struct ChatView: View {
     // MARK: - 输入栏
 
     private var inputBar: some View {
-        HStack(spacing: 10) {
-            TextField("输入消息…", text: $input)
-                .textFieldStyle(.roundedBorder)
-                .disabled(isStreaming)
-                .onSubmit { send() }
+        VStack(spacing: 8) {
+            if !queued.isEmpty { queuedBar }
+            if !attachments.isEmpty { attachmentBar }
 
-            if isStreaming {
-                Button(action: stop) {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.system(size: 28))
-                        .foregroundColor(.red)
+            HStack(spacing: 8) {
+                Menu {
+                    Button {
+                        openPicker(.photo)
+                    } label: {
+                        Label("从相册选择图片", systemImage: "photo")
+                    }
+                    Button {
+                        openPicker(.camera)
+                    } label: {
+                        Label("拍照", systemImage: "camera")
+                    }
+                    Button {
+                        activeSheet = .files
+                    } label: {
+                        Label("引用项目文件", systemImage: "doc.text.magnifyingglass")
+                    }
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 26))
                 }
-            } else {
-                Button(action: send) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 28))
+
+                TextField("输入消息…", text: $input)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { send(delivery: nil) }
+
+                if isStreaming {
+                    Menu {
+                        Button {
+                            send(delivery: "steer")
+                        } label: {
+                            Label("插话（立即发送）", systemImage: "arrow.up.circle")
+                        }
+                        Button {
+                            send(delivery: "queue")
+                        } label: {
+                            Label("排队到下一轮", systemImage: "tray.and.arrow.down")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            stop()
+                        } label: {
+                            Label("停止生成", systemImage: "stop.circle")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle.fill")
+                            .font(.system(size: 28))
+                    }
+                } else {
+                    Button {
+                        send(delivery: nil)
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 28))
+                    }
+                    .disabled(canSend == false)
                 }
-                .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
         .background(Color(uiColor: .systemBackground))
+    }
+
+    private var canSend: Bool {
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+    }
+
+    // MARK: - 排队与附件
+
+    private var queuedBar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: "tray.full").font(.caption2)
+                Text("排队中 \(queued.count) 条（当前回复结束后自动发送）").font(.caption2)
+                Spacer()
+            }
+            .foregroundColor(.secondary)
+
+            ForEach(queued) { item in
+                HStack(spacing: 6) {
+                    Text(item.text.isEmpty ? "（附件）" : item.text)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        removeQueued(item)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").font(.caption)
+                    }
+                    .foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .cornerRadius(8)
+    }
+
+    private var attachmentBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { item in
+                    HStack(spacing: 4) {
+                        if let preview = item.preview {
+                            Image(uiImage: preview)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 26, height: 26)
+                                .clipped()
+                                .cornerRadius(4)
+                        } else {
+                            Image(systemName: "doc").font(.caption2)
+                        }
+                        Text(item.name).font(.caption2).lineLimit(1)
+                        Button {
+                            attachments.removeAll { $0.id == item.id }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill").font(.caption2)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color(uiColor: .secondarySystemBackground))
+                    .cornerRadius(6)
+                }
+            }
+        }
     }
 
     // MARK: - 启动与加载
@@ -220,6 +356,7 @@ struct ChatView: View {
         Task {
             await loadModels()
             await loadMessages()
+            await refreshQueued()
             await refreshInteractions()
         }
         pollTask?.cancel()
@@ -227,6 +364,7 @@ struct ChatView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
                 if Task.isCancelled { break }
+                await refreshQueued()
                 await refreshInteractions()
             }
         }
@@ -342,6 +480,35 @@ struct ChatView: View {
                 dismissedFormIDs.insert(form.id)
                 activeSheet = nil
             })
+
+        case .rename:
+            RenameSheet(title: title, onSave: { newTitle in
+                activeSheet = nil
+                rename(newTitle)
+            }, onCancel: {
+                activeSheet = nil
+            })
+
+        case .photo:
+            ImagePicker(sourceType: .photoLibrary) { image in
+                activeSheet = nil
+                addAttachment(image)
+            }
+
+        case .camera:
+            ImagePicker(sourceType: .camera) { image in
+                activeSheet = nil
+                addAttachment(image)
+            }
+
+        case .files:
+            FileSearchSheet(onPick: { path in
+                activeSheet = nil
+                let spacer = input.isEmpty ? "" : " "
+                input += "\(spacer)@\(path) "
+            }, onCancel: {
+                activeSheet = nil
+            })
         }
     }
 
@@ -382,6 +549,7 @@ struct ChatView: View {
             isStreaming = false
             streaming = nil
             Task { await loadMessages() }
+            Task { await refreshQueued() }
 
         case "session.renamed":
             if sid == session.id, let newTitle = event.data["title"] as? String { title = newTitle }
@@ -397,24 +565,37 @@ struct ChatView: View {
 
     // MARK: - 发送 / 停止 / 切模型
 
-    private func send() {
+    private func send(delivery: String?) {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let files = attachments.map { OpenCodeClient.OCFileAttachment(uri: $0.uri, name: $0.name) }
+        guard !text.isEmpty || !files.isEmpty else { return }
+
         input = ""
+        attachments = []
         errorMessage = nil
+        let isQueue = delivery == "queue"
+        let displayText = text.isEmpty ? "（附件）" : text
         let localID = "local-\(UUID().uuidString)"
-        messages.append(OpenCodeClient.OCMessage(id: localID, kind: .user, text: text, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false))
-        isStreaming = true
+
+        if !isQueue {
+            messages.append(OpenCodeClient.OCMessage(id: localID, kind: .user, text: displayText, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false))
+            isStreaming = true
+        }
+
         let model = availableModels.first { $0.id == config.selectedModel }
         Task {
             do {
                 if let model {
                     try? await client.switchModel(sessionID: session.id, model: model)
                 }
-                let serverID = try await client.sendPrompt(sessionID: session.id, text: text)
-                await MainActor.run {
-                    if let serverID, let index = messages.firstIndex(where: { $0.id == localID }) {
-                        messages[index] = OpenCodeClient.OCMessage(id: serverID, kind: .user, text: text, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false)
+                let serverID = try await client.sendPrompt(sessionID: session.id, text: text, delivery: delivery, files: files)
+                if isQueue {
+                    await refreshQueued()
+                } else if let serverID {
+                    await MainActor.run {
+                        if let index = messages.firstIndex(where: { $0.id == localID }) {
+                            messages[index] = OpenCodeClient.OCMessage(id: serverID, kind: .user, text: displayText, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false)
+                        }
                     }
                 }
             } catch {
@@ -424,6 +605,42 @@ struct ChatView: View {
                 }
             }
         }
+    }
+
+    private func refreshQueued() async {
+        do {
+            let list = try await client.inbox(sessionID: session.id)
+            await MainActor.run { queued = list }
+        } catch {}
+    }
+
+    private func removeQueued(_ item: OpenCodeClient.OCInboxMessage) {
+        Task {
+            try? await client.deleteInbox(sessionID: session.id, inboxID: item.id)
+            await refreshQueued()
+        }
+    }
+
+    private func rename(_ newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        title = trimmed
+        Task { try? await client.renameSession(sessionID: session.id, title: trimmed) }
+    }
+
+    private func openPicker(_ sheet: ChatSheet) {
+        if case .camera = sheet, !UIImagePickerController.isSourceTypeAvailable(.camera) {
+            errorMessage = "这台设备没有可用的相机"
+            return
+        }
+        activeSheet = sheet
+    }
+
+    private func addAttachment(_ image: UIImage) {
+        guard let data = image.jpegData(compressionQuality: 0.7) else { return }
+        let uri = "data:image/jpeg;base64," + data.base64EncodedString()
+        let name = "image_\(attachments.count + 1).jpg"
+        attachments.append(PendingAttachment(name: name, uri: uri, preview: image))
     }
 
     private func stop() {

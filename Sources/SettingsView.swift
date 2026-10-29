@@ -54,6 +54,11 @@ struct SettingsView: View {
                             .foregroundColor(testResult.hasPrefix("连接成功") ? .green : .red)
                     }
                 }
+                Section(footer: Text("删除后，助手再次执行同类操作时会重新询问。")) {
+                    NavigationLink(destination: SavedPermissionsView()) {
+                        Label("已保存的授权", systemImage: "checkmark.shield")
+                    }
+                }
             }
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
