@@ -1,172 +1,142 @@
 import SwiftUI
+import UIKit
 
-/// 单会话聊天界面（即时对话 + 模型选择）。
+/// 聊天页可能弹出的交互
+enum ChatSheet: Identifiable {
+    case permission(OpenCodeClient.OCPermission)
+    case form(OpenCodeClient.OCForm)
+
+    var id: String {
+        switch self {
+        case .permission(let p): return "p-\(p.id)"
+        case .form(let f): return "f-\(f.id)"
+        }
+    }
+}
+
+/// 单会话聊天界面（V2：prompt + /api/event 事件流 + 权限/表单弹窗）。
 struct ChatView: View {
     let session: OpenCodeClient.OCSession
-    @EnvironmentObject private var store: SessionStore
+
     @EnvironmentObject private var config: ServerConfig
     @State private var messages: [OpenCodeClient.OCMessage] = []
+    @State private var streaming: OpenCodeClient.OCMessage?
     @State private var input = ""
+    @State private var isStreaming = false
+    @State private var isConnected = false
     @State private var isLoading = false
     @State private var isLoadingMore = false
-    @State private var hasMoreHistory = true
+    @State private var olderCursor: String?
     @State private var errorMessage: String?
-    @State private var isStreaming = false
-    @State private var streamingText = ""
     @State private var availableModels: [OpenCodeClient.OCModel] = []
     @State private var isModelsLoading = false
-    @State private var pendingCommand: String?
+    @State private var activeSheet: ChatSheet?
+    @State private var dismissedPermissionIDs: Set<String> = []
+    @State private var dismissedFormIDs: Set<String> = []
+    @State private var title: String
+    @State private var pollTask: Task<Void, Never>?
 
     private let client = OpenCodeClient.shared
-    private let pageSize = 30
+    @StateObject private var stream = OCEventStream()
+    private let pageSize = 40
+
+    init(session: OpenCodeClient.OCSession) {
+        self.session = session
+        _title = State(initialValue: session.title ?? "会话")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            modelPicker
+            statusBar
             messageList
             Divider()
             inputBar
         }
-        .navigationTitle(session.title ?? "会话")
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Menu {
-                    Button("压缩上下文 (/compact)") {
-                        pendingCommand = "/compact"
-                    }
-                    Button("新建会话 (/new)") {
-                        pendingCommand = "/new"
-                    }
-                    Button("清空本会话 (/clear)") {
-                        pendingCommand = "/clear"
-                    }
-                } label: {
-                    Image(systemName: "slider.horizontal.3").accessibilityLabel("会话工具")
-                }
-                .disabled(isStreaming)
-            }
+        .onAppear { start() }
+        .onDisappear {
+            stream.stop()
+            pollTask?.cancel()
         }
-        .confirmationDialog(
-            pendingCommandConfirmTitle,
-            isPresented: commandDialogPresented,
-            titleVisibility: .visible
-        ) {
-            Button("确认发送 \(pendingCommand ?? "")", role: .destructive) {
-                sendCommand(pendingCommand ?? "")
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text(pendingCommandConfirmMessage)
+        .onChange(of: config.selectedModel) { newValue in
+            switchModel(newValue)
         }
-        .onAppear {
-            Task { await loadInitial() }
+        .sheet(item: $activeSheet) { sheet in
+            sheetView(sheet)
         }
     }
 
-    private var pendingCommandConfirmTitle: String {
-        switch pendingCommand {
-        case "/compact": return "压缩上下文"
-        case "/new": return "新建会话"
-        case "/clear": return "清空本会话"
-        default: return "会话工具"
-        }
-    }
+    // MARK: - 顶栏（模型 / 连接状态）
 
-    private var pendingCommandConfirmMessage: String {
-        switch pendingCommand {
-        case "/compact": return "把本会话历史压缩为摘要，保留话题并加快后续回复"
-        case "/new": return "开启全新空白会话，当前会话仍会保留"
-        case "/clear": return "清除本会话全部历史记录"
-        default: return ""
-        }
-    }
-
-    private func sendCommand(_ command: String) {
-        input = command
-        send()
-    }
-
-    private var modelPicker: some View {
-        HStack {
+    private var statusBar: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(isConnected ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
             if isModelsLoading {
-                ProgressView()
-                    .controlSize(.small)
-                Text("加载模型…")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                ProgressView().controlSize(.small)
+                Text("加载模型…").font(.caption).foregroundColor(.secondary)
             } else if availableModels.isEmpty {
-                Text("当前服务器无可用模型")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-            } else if let selected = currentModel {
-                Text("模型：\(selected.displayName)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
+                Text("无可用模型").font(.caption).foregroundColor(.secondary)
+            } else {
                 Menu {
-                    Picker("选择模型", selection: Binding(
-                        get: { config.selectedModel },
-                        set: { config.selectedModel = $0 }
-                    )) {
-                        ForEach(availableModels) { model in
-                            Text(model.displayName).tag(model.id)
+                    ForEach(availableModels) { model in
+                        Button {
+                            config.selectedModel = model.id
+                        } label: {
+                            if model.id == config.selectedModel {
+                                Label(model.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(model.displayName)
+                            }
                         }
                     }
                 } label: {
-                    Image(systemName: "chevron.down.circle")
-                        .font(.system(size: 18))
+                    HStack(spacing: 3) {
+                        Text(currentModelName).font(.caption).foregroundColor(.primary)
+                        Image(systemName: "chevron.down").font(.system(size: 9))
+                    }
                 }
-            } else {
-                Text("加载模型失败")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button("重试") { Task { await loadModels() } }
-                    .font(.caption)
+            }
+            Spacer()
+            if !isConnected {
+                Text("重连中…").font(.caption2).foregroundColor(.secondary)
             }
         }
         .padding(.horizontal)
         .padding(.vertical, 6)
-        .background(Color(.secondarySystemBackground).opacity(0.5))
+        .background(Color(uiColor: .secondarySystemBackground).opacity(0.5))
     }
 
-    private var currentModel: OpenCodeClient.OCModel? {
-        availableModels.first { $0.id == config.selectedModel }
+    private var currentModelName: String {
+        if let m = availableModels.first(where: { $0.id == config.selectedModel }) { return m.displayName }
+        return availableModels.first?.displayName ?? "模型"
     }
 
-    private var commandDialogPresented: Binding<Bool> {
-        Binding(
-            get: { pendingCommand != nil },
-            set: { if !$0 { pendingCommand = nil } }
-        )
-    }
+    // MARK: - 消息列表
 
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    if !hasMoreHistory {
-                        Text("--------- 对话开始 ---------")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .padding(.top, 8)
-                    } else {
+                    if olderCursor != nil {
                         Button {
-                            Task { await loadOlderMessages() }
+                            Task { await loadOlder() }
                         } label: {
                             if isLoadingMore {
                                 ProgressView().controlSize(.small)
                             } else {
-                                Text("加载更早消息")
-                                    .font(.caption)
-                                    .foregroundColor(.accentColor)
+                                Text("加载更早消息").font(.caption).foregroundColor(.accentColor)
                             }
                         }
                         .padding(.top, 8)
+                    } else if !messages.isEmpty {
+                        Text("--------- 对话开始 ---------")
+                            .font(.caption).foregroundColor(.secondary).padding(.top, 8)
                     }
-                    if let errorMessage, errorMessage.isEmpty == false {
+
+                    if let errorMessage, !errorMessage.isEmpty {
                         Text(errorMessage)
                             .font(.footnote)
                             .foregroundColor(.red)
@@ -175,42 +145,42 @@ struct ChatView: View {
                             .background(Color.red.opacity(0.08))
                             .cornerRadius(8)
                     }
-                    if messages.isEmpty && !isStreaming {
+
+                    if messages.isEmpty && streaming == nil && !isStreaming {
                         Text("发送消息开始对话")
                             .foregroundColor(.secondary)
                             .padding(.top, 40)
                     }
+
                     ForEach(messages) { msg in
-                        MessageBubble(message: msg)
-                            .id(msg.id)
+                        MessageBubble(message: msg).id(msg.id)
                     }
-                    if isStreaming {
-                        MessageBubble(
-                            message: OpenCodeClient.OCMessage(
-                                id: "streaming",
-                                role: "assistant",
-                                content: streamingText,
-                                isStreaming: true,
-                                error: false,
-                                completed: false
-                            )
-                        )
-                        .id("streaming")
+
+                    if let streaming {
+                        MessageBubble(message: streaming).id("streaming")
                     }
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 8)
             }
             .onChange(of: messages.count) { _ in
-                if let last = messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
+                scrollToBottom(proxy)
             }
-            .onChange(of: streamingText) { _ in
+            .onChange(of: streaming?.text) { _ in
                 withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
             }
         }
     }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        if streaming != nil {
+            withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
+        } else if let last = messages.last {
+            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+        }
+    }
+
+    // MARK: - 输入栏
 
     private var inputBar: some View {
         HStack(spacing: 10) {
@@ -218,156 +188,400 @@ struct ChatView: View {
                 .textFieldStyle(.roundedBorder)
                 .disabled(isStreaming)
                 .onSubmit { send() }
-            Button(action: send) {
-                if isLoading {
-                    ProgressView()
-                        .frame(width: 22, height: 22)
-                } else {
+
+            if isStreaming {
+                Button(action: stop) {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(.red)
+                }
+            } else {
+                Button(action: send) {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.system(size: 28))
                 }
+                .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isStreaming)
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
-        .background(Color(.systemBackground))
+        .background(Color(uiColor: .systemBackground))
     }
 
-    @MainActor
-    private func loadInitial() async {
-        async let models: Void = loadModelsIfNeeded()
-        async let msgs: Void = loadMessages()
-        _ = await (models, msgs)
+    // MARK: - 启动与加载
+
+    private func start() {
+        guard config.isConfigured else { return }
+        stream.start(onEvent: { event in
+            Task { @MainActor in handle(event) }
+        }, onState: { ok in
+            Task { @MainActor in isConnected = ok }
+        })
+        Task {
+            await loadModels()
+            await loadMessages()
+            await refreshInteractions()
+        }
+        pollTask?.cancel()
+        pollTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if Task.isCancelled { break }
+                await refreshInteractions()
+            }
+        }
     }
 
-    @MainActor
-    private func loadModelsIfNeeded() async {
-        guard availableModels.isEmpty else { return }
-        await loadModels()
-    }
-
-    @MainActor
     private func loadModels() async {
-        isModelsLoading = true
-        defer { isModelsLoading = false }
+        await MainActor.run { isModelsLoading = true }
         do {
             let list = try await client.models()
-            availableModels = list
-            if config.selectedModel.isEmpty || !list.contains(where: { $0.id == config.selectedModel }) {
-                config.selectedModel = list.first?.id ?? ""
+            await MainActor.run {
+                availableModels = list
+                isModelsLoading = false
+                if config.selectedModel.isEmpty || !list.contains(where: { $0.id == config.selectedModel }) {
+                    config.selectedModel = session.modelID ?? list.first?.id ?? ""
+                }
             }
         } catch {
-            // 模型列表失败不阻塞聊天
+            await MainActor.run { isModelsLoading = false }
         }
     }
 
-    @MainActor
     private func loadMessages() async {
-        isLoading = true
-        errorMessage = nil
+        await MainActor.run { isLoading = true }
         do {
-            let latest = try await client.messages(sessionID: session.id, limit: pageSize)
-            messages = latest
-            hasMoreHistory = latest.count >= pageSize
-            // 加载到更早的历史（如果有），让列表完整
-            await loadOlderMessages()
+            let page = try await client.messages(sessionID: session.id, limit: pageSize)
+            await MainActor.run {
+                messages = page.messages
+                olderCursor = page.olderCursor
+                errorMessage = nil
+                isLoading = false
+            }
         } catch {
-            errorMessage = error.localizedDescription
+            await MainActor.run {
+                errorMessage = error.localizedDescription
+                isLoading = false
+            }
         }
-        isLoading = false
     }
 
-    @MainActor
-    private func loadOlderMessages() async {
-        guard hasMoreHistory, !isLoadingMore, let before = messages.first?.id else { return }
-        isLoadingMore = true
-        defer { isLoadingMore = false }
+    private func loadOlder() async {
+        guard let cursor = olderCursor, !isLoadingMore else { return }
+        await MainActor.run { isLoadingMore = true }
         do {
-            let older = try await client.messages(sessionID: session.id, limit: pageSize, before: before)
-            hasMoreHistory = older.count >= pageSize
-            // 去重合并，保持时间升序（旧的在前）
-            let existing = Set(messages.map { $0.id })
-            let newOnes = older.filter { !existing.contains($0.id) }
-            messages = newOnes + messages
+            let page = try await client.messages(sessionID: session.id, limit: pageSize, cursor: cursor)
+            await MainActor.run {
+                let existing = Set(messages.map { $0.id })
+                let newOnes = page.messages.filter { !existing.contains($0.id) }
+                messages = newOnes + messages
+                olderCursor = page.olderCursor
+                isLoadingMore = false
+            }
         } catch {
-            // 静默：可能是没有更早消息了
-            hasMoreHistory = false
+            await MainActor.run {
+                olderCursor = nil
+                isLoadingMore = false
+            }
         }
     }
+
+    // MARK: - 交互（权限 / 表单）
+
+    private func refreshInteractions() async {
+        guard activeSheet == nil else { return }
+        do {
+            let permissions = try await client.permissions()
+                .filter { $0.sessionID == session.id && !dismissedPermissionIDs.contains($0.id) }
+            if let request = permissions.first {
+                await MainActor.run { activeSheet = .permission(request) }
+                return
+            }
+        } catch {}
+        do {
+            let forms = try await client.forms(sessionID: session.id)
+                .filter { !dismissedFormIDs.contains($0.id) }
+            if let form = forms.first {
+                await MainActor.run { activeSheet = .form(form) }
+            }
+        } catch {}
+    }
+
+    @ViewBuilder
+    private func sheetView(_ sheet: ChatSheet) -> some View {
+        switch sheet {
+        case .permission(let request):
+            PermissionSheet(request: request) { decision in
+                dismissedPermissionIDs.insert(request.id)
+                activeSheet = nil
+                Task {
+                    do {
+                        try await client.replyPermission(request, decision: decision)
+                    } catch {
+                        await MainActor.run { errorMessage = error.localizedDescription }
+                    }
+                    await refreshInteractions()
+                }
+            } onDismiss: {
+                dismissedPermissionIDs.insert(request.id)
+                activeSheet = nil
+            }
+        case .form(let form):
+            FormSheet(form: form, onSubmit: { answer in
+                dismissedFormIDs.insert(form.id)
+                activeSheet = nil
+                Task {
+                    do {
+                        try await client.replyForm(form, answer: answer)
+                    } catch {
+                        await MainActor.run { errorMessage = error.localizedDescription }
+                    }
+                    await refreshInteractions()
+                }
+            }, onCancel: {
+                dismissedFormIDs.insert(form.id)
+                activeSheet = nil
+            })
+        }
+    }
+
+    // MARK: - 事件处理
+
+    private func handle(_ event: OCEvent) {
+        let sid = event.data["sessionID"] as? String
+        switch event.type {
+        case "session.text.started":
+            guard sid == session.id else { return }
+            let mid = event.data["assistantMessageID"] as? String ?? "streaming"
+            if streaming?.id != mid {
+                streaming = OpenCodeClient.OCMessage(id: mid, kind: .assistant, text: "", reasoning: "", tools: [], created: nowMs(), isStreaming: true, isError: false)
+            }
+            isStreaming = true
+
+        case "session.text.delta":
+            guard sid == session.id, let delta = event.data["delta"] as? String else { return }
+            let mid = event.data["assistantMessageID"] as? String ?? "streaming"
+            var msg = streaming ?? OpenCodeClient.OCMessage(id: mid, kind: .assistant, text: "", reasoning: "", tools: [], created: nowMs(), isStreaming: true, isError: false)
+            msg.text += delta
+            streaming = msg
+            isStreaming = true
+
+        case "session.text.ended":
+            guard sid == session.id else { return }
+            if let full = event.data["text"] as? String {
+                var msg = streaming ?? OpenCodeClient.OCMessage(id: event.data["assistantMessageID"] as? String ?? "streaming", kind: .assistant, text: "", reasoning: "", tools: [], created: nowMs(), isStreaming: true, isError: false)
+                msg.text = full
+                streaming = msg
+            }
+
+        case "session.execution.started":
+            if sid == session.id { isStreaming = true }
+
+        case "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.execution.cancelled":
+            guard sid == session.id else { return }
+            isStreaming = false
+            streaming = nil
+            Task { await loadMessages() }
+
+        case "session.renamed":
+            if sid == session.id, let newTitle = event.data["title"] as? String { title = newTitle }
+
+        default:
+            if event.type.contains("permission") || event.type.contains("form") {
+                if sid == nil || sid == session.id {
+                    Task { await refreshInteractions() }
+                }
+            }
+        }
+    }
+
+    // MARK: - 发送 / 停止 / 切模型
 
     private func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isStreaming else { return }
+        guard !text.isEmpty else { return }
         input = ""
+        errorMessage = nil
+        let localID = "local-\(UUID().uuidString)"
+        messages.append(OpenCodeClient.OCMessage(id: localID, kind: .user, text: text, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false))
+        isStreaming = true
+        let model = availableModels.first { $0.id == config.selectedModel }
         Task {
-            await MainActor.run {
-                messages.append(OpenCodeClient.OCMessage(
-                    id: UUID().uuidString, role: "user", content: text, isStreaming: false, error: false, completed: true
-                ))
-                isStreaming = true
-                streamingText = ""
-                errorMessage = nil
-            }
             do {
-                let model = availableModels.first { $0.id == config.selectedModel }
-                _ = try await client.sendMessage(
-                    sessionID: session.id,
-                    text: text,
-                    model: model
-                ) { chunk in
-                    Task { @MainActor in
-                        streamingText = chunk
+                if let model {
+                    try? await client.switchModel(sessionID: session.id, model: model)
+                }
+                let serverID = try await client.sendPrompt(sessionID: session.id, text: text)
+                await MainActor.run {
+                    if let serverID, let index = messages.firstIndex(where: { $0.id == localID }) {
+                        messages[index] = OpenCodeClient.OCMessage(id: serverID, kind: .user, text: text, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false)
                     }
                 }
-                await MainActor.run {
-                    isStreaming = false
-                    streamingText = ""
-                    // 以服务器保存的消息为准，重新加载列表（避免本地乐观消息与服务器重复）
-                    messages.removeLast()
-                }
-                await loadMessages()
             } catch {
                 await MainActor.run {
                     isStreaming = false
-                    streamingText = ""
                     errorMessage = error.localizedDescription
                 }
             }
         }
     }
+
+    private func stop() {
+        Task {
+            do {
+                try await client.interrupt(sessionID: session.id)
+            } catch {
+                await MainActor.run { errorMessage = error.localizedDescription }
+            }
+            await MainActor.run { isStreaming = false }
+        }
+    }
+
+    private func switchModel(_ id: String) {
+        guard let model = availableModels.first(where: { $0.id == id }) else { return }
+        Task { try? await client.switchModel(sessionID: session.id, model: model) }
+    }
+
+    private func nowMs() -> Double {
+        Date().timeIntervalSince1970 * 1000
+    }
 }
+
+// MARK: - 消息气泡
 
 struct MessageBubble: View {
     let message: OpenCodeClient.OCMessage
 
     var body: some View {
         HStack {
-            if message.role == "user" {
-                Spacer(minLength: 50)
-            }
-            VStack(alignment: message.role == "user" ? .trailing : .leading, spacing: 4) {
+            if message.kind == .user { Spacer(minLength: 40) }
+            VStack(alignment: message.kind == .user ? .trailing : .leading, spacing: 6) {
                 Text(message.displayName)
                     .font(.caption)
                     .foregroundColor(.secondary)
-                if message.error {
-                    Text("回复失败")
+
+                if !message.reasoning.isEmpty {
+                    ReasoningBubble(text: message.reasoning)
+                }
+
+                if !message.text.isEmpty {
+                    Text(attributed(message.text))
+                        .font(.body)
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14)
+                                .fill(message.kind == .user ? Color.accentColor.opacity(0.15) : Color(uiColor: .secondarySystemBackground))
+                        )
+                } else if message.isStreaming {
+                    Text("…")
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(Color(uiColor: .secondarySystemBackground)))
+                }
+
+                ForEach(message.tools) { tool in
+                    ToolRow(tool: tool)
+                }
+
+                if message.isError {
+                    Text(message.errorText ?? "回复失败")
                         .font(.footnote)
                         .foregroundColor(.red)
                 }
-                Text(message.content.isEmpty && message.isStreaming ? "…" : message.content)
-                    .font(.body)
+            }
+            if message.kind != .user { Spacer(minLength: 40) }
+        }
+    }
+
+    private func attributed(_ text: String) -> AttributedString {
+        (try? AttributedString(markdown: text)) ?? AttributedString(text)
+    }
+}
+
+private struct ReasoningBubble: View {
+    let text: String
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                withAnimation { expanded.toggle() }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "brain").font(.caption2)
+                    Text(expanded ? "思考过程（点击收起）" : "思考过程（点击展开）").font(.caption2)
+                }
+                .foregroundColor(.secondary)
+            }
+            if expanded {
+                Text(text)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                     .textSelection(.enabled)
-                    .padding(12)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(message.role == "user" ? Color.accentColor.opacity(0.15) : Color(.secondarySystemBackground))
-                    )
-                    .foregroundColor(.primary)
             }
-            if message.role != "user" {
-                Spacer(minLength: 50)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct ToolRow: View {
+    let tool: OpenCodeClient.OCTool
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.caption)
+                    .foregroundColor(color)
+                Text(tool.name).font(.caption).bold()
+                Text(statusText).font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                Button(expanded ? "收起" : "详情") {
+                    withAnimation { expanded.toggle() }
+                }
+                .font(.caption2)
             }
+            if expanded {
+                if !tool.input.isEmpty {
+                    Text(tool.input)
+                        .font(.caption2.monospaced())
+                        .textSelection(.enabled)
+                        .foregroundColor(.secondary)
+                }
+                if !tool.output.isEmpty {
+                    Text(String(tool.output.prefix(4000)))
+                        .font(.caption2.monospaced())
+                        .textSelection(.enabled)
+                }
+                if let error = tool.error {
+                    Text(error).font(.caption2).foregroundColor(.red)
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: .tertiarySystemBackground)))
+    }
+
+    private var icon: String {
+        if tool.isError { return "exclamationmark.triangle.fill" }
+        if tool.isRunning { return "hourglass" }
+        return "wrench.and.screwdriver.fill"
+    }
+
+    private var color: Color {
+        if tool.isError { return .red }
+        if tool.isRunning { return .orange }
+        return .accentColor
+    }
+
+    private var statusText: String {
+        switch tool.status {
+        case "streaming": return "准备中"
+        case "running": return "运行中"
+        case "completed": return "完成"
+        case "error": return "失败"
+        default: return tool.status
         }
     }
 }

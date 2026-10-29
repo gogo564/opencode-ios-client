@@ -16,19 +16,22 @@ struct SettingsView: View {
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                         .textContentType(.URL)
-                    Text("例如 http://192.168.1.100:3000")
+                    Text("例如 https://gogo564.duckdns.org:4097")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                Section(header: Text("认证")) {
-                    TextField("用户名", text: $config.username)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
+                Section(header: Text("认证"), footer: Text("OpenCode V2 的 Basic Auth 用户名固定为 opencode，只需填密码。")) {
+                    HStack {
+                        Text("用户名")
+                        Spacer()
+                        Text(ServerConfig.fixedUsername)
+                            .foregroundColor(.secondary)
+                    }
                     SecureField("密码", text: $config.password)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                 }
-                Section {
+                Section(footer: Text("测试连接会调用服务器的 /api/session 接口，验证地址和密码是否正确。")) {
                     Button {
                         testConnection()
                     } label: {
@@ -50,8 +53,6 @@ struct SettingsView: View {
                             .font(.subheadline)
                             .foregroundColor(testResult.hasPrefix("连接成功") ? .green : .red)
                     }
-                } footer: {
-                    Text("测试连接会调用服务器的 /session 接口，验证地址和密码是否正确。")
                 }
             }
             .navigationTitle("设置")

@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// 会话列表状态管理。
 final class SessionStore: ObservableObject {

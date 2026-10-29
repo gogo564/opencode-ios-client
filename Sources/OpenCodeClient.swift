@@ -1,27 +1,48 @@
 import Foundation
+import Combine
 
 enum OCError: LocalizedError {
     case invalidURL
     case http(Int)
     case notConfigured
     case decoding
+    case unauthorized
 
     var errorDescription: String? {
         switch self {
         case .invalidURL: return "服务器地址无效"
-        case .http(let code): return "服务器错误（HTTP \(code)）"
+        case .http(let code):
+            if code == 401 { return "认证失败：V2 的用户名固定为 opencode，请检查密码" }
+            if code == 404 { return "接口不存在（HTTP 404），服务器可能不是 OpenCode V2" }
+            return "服务器错误（HTTP \(code)）"
         case .notConfigured: return "请先在设置中填写服务器地址和密码"
-        case .decoding: return "返回数据解析失败"
+        case .decoding: return "返回数据解析失败（服务器可能返回了网页而不是 JSON）"
+        case .unauthorized: return "认证失败：V2 的用户名固定为 opencode，请检查密码"
         }
     }
 }
 
-/// opencode server HTTP API 客户端（Basic Auth）。
+/// OpenCode V2 服务器 HTTP API 客户端（Basic Auth）。
+///
+/// 与 V1 的差别：
+/// - 所有接口前缀为 `/api`
+/// - 发消息是 `POST /api/session/{id}/prompt`，回复通过 `GET /api/event` 事件流推送
+/// - 权限确认、表单（选择题）分别走 `/api/permission/*`、`/api/session/{id}/form/*`
 final class OpenCodeClient {
     static let shared = OpenCodeClient()
     private let config = ServerConfig.shared
 
-    private func makeRequest(_ path: String, method: String = "GET", body: Data? = nil, query: [URLQueryItem] = []) throws -> URLRequest {
+    private let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 60
+        cfg.timeoutIntervalForResource = 3600
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }()
+
+    // MARK: - 请求
+
+    private func makeRequest(_ path: String, method: String = "GET", body: [String: Any]? = nil, query: [URLQueryItem] = []) throws -> URLRequest {
         guard config.isConfigured, var comps = URLComponents(string: config.normalizedBaseURL + path) else {
             throw OCError.notConfigured
         }
@@ -33,323 +54,442 @@ final class OpenCodeClient {
             request.setValue(auth, forHTTPHeaderField: "Authorization")
         }
         if let body {
-            request.httpBody = body
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 30
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 60
         return request
+    }
+
+    private func perform(_ request: URLRequest, allowEmpty: Bool = true) async throws -> Data {
+        let (data, response) = try await session.data(for: request)
+        try ensureOK(response, data: data)
+        return data
+    }
+
+    private func ensureOK(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else { return }
+        if http.statusCode == 401 { throw OCError.unauthorized }
+        if http.statusCode >= 400 { throw OCError.http(http.statusCode) }
+        // V2 的旧路径会回退成网页，这里提前识别，避免报难懂的解析错误
+        if let prefix = String(data: data.prefix(1), encoding: .utf8), prefix == "<" {
+            throw OCError.decoding
+        }
+    }
+
+    private func dictionary(_ data: Data) throws -> [String: Any] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw OCError.decoding
+        }
+        return obj
+    }
+
+    private func number(_ any: Any?) -> Double? {
+        if let d = any as? Double { return d }
+        if let i = any as? Int { return Double(i) }
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String { return Double(s) }
+        return nil
+    }
+
+    // MARK: - 数据模型
+
+    struct OCModel: Identifiable, Hashable {
+        let id: String            // Model.Ref.id（即 modelID）
+        let modelID: String
+        let providerID: String
+        let name: String
+
+        var displayName: String { name.isEmpty ? id : name }
+    }
+
+    struct OCSession: Identifiable, Hashable {
+        let id: String
+        let title: String?
+        let created: Double
+        let updated: Double
+        let modelID: String?
+        let providerID: String?
+
+        var updatedDate: Date { Date(timeIntervalSince1970: updated / 1000) }
+    }
+
+    struct OCTool: Identifiable {
+        let id: String
+        let name: String
+        let status: String      // streaming / running / completed / error
+        let input: String
+        let output: String
+        let error: String?
+
+        var isRunning: Bool { status == "running" || status == "streaming" }
+        var isError: Bool { status == "error" }
+    }
+
+    struct OCMessage: Identifiable {
+        enum Kind { case user, assistant }
+        let id: String
+        let kind: Kind
+        var text: String
+        var reasoning: String
+        var tools: [OCTool]
+        let created: Double
+        var isStreaming: Bool
+        var isError: Bool
+        var errorText: String? = nil
+
+        var displayName: String { kind == .user ? "我" : "Assistant" }
+    }
+
+    struct OCMessagesPage {
+        let messages: [OCMessage]      // 按时间升序
+        let olderCursor: String?       // 继续往前翻的游标
+    }
+
+    struct OCPermission: Identifiable {
+        let id: String
+        let sessionID: String
+        let action: String
+        let resources: [String]
+        let message: String?
+    }
+
+    struct OCOption: Identifiable, Hashable {
+        let value: String
+        let label: String
+        let detail: String
+        var id: String { value }
+    }
+
+    struct OCFormField: Identifiable {
+        let key: String
+        let title: String
+        let description: String
+        let type: String       // string / number / integer / boolean / multiselect / external
+        let required: Bool
+        let hidden: Bool
+        let custom: Bool
+        let conditional: Bool
+        let options: [OCOption]
+        let defaultValue: Any?
+        let url: String
+
+        var id: String { key }
+    }
+
+    struct OCForm: Identifiable {
+        let id: String
+        let sessionID: String
+        let title: String
+        let fields: [OCFormField]
     }
 
     // MARK: - 模型
 
-    struct OCModel: Identifiable, Hashable {
-        let id: String            // providerID/modelID
-        let providerID: String
-        let modelID: String
-        let name: String
-        let providerName: String
-
-        var displayName: String {
-            name.isEmpty ? id : "\(name)"
-        }
-    }
-
-    /// GET /config/providers 返回 { providers: [...], default: {...} }
+    /// GET /api/model -> { location, data: [Model.Info] }
     func models() async throws -> [OCModel] {
-        let request = try makeRequest("/config/providers")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try ensureOK(response)
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let providers = json["providers"] as? [[String: Any]] else {
-            throw OCError.decoding
-        }
+        let data = try await perform(try makeRequest("/api/model"))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
         var result: [OCModel] = []
-        for provider in providers {
-            let providerID = provider["id"] as? String ?? ""
-            let providerName = provider["name"] as? String ?? providerID
-            let modelsDict = provider["models"] as? [String: Any] ?? [:]
-            for (modelID, value) in modelsDict {
-                let name = (value as? [String: Any])?["name"] as? String ?? modelID
-                result.append(OCModel(
-                    id: "\(providerID)/\(modelID)",
-                    providerID: providerID,
-                    modelID: modelID,
-                    name: name,
-                    providerName: providerName
-                ))
-            }
+        for item in arr {
+            guard let modelID = item["modelID"] as? String ?? item["id"] as? String else { continue }
+            let providerID = item["providerID"] as? String ?? ""
+            let enabled = item["enabled"] as? Bool ?? true
+            guard enabled else { continue }
+            let name = item["name"] as? String ?? modelID
+            result.append(OCModel(id: modelID, modelID: modelID, providerID: providerID, name: name))
         }
-        return result.sorted { $0.displayName < $1.displayName }
+        return result.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
     // MARK: - 会话
 
-    struct OCSession: Identifiable, Codable {
-        let id: String
-        let title: String?
-        let time: OCSessionTime?
-
-        enum CodingKeys: String, CodingKey {
-            case id, title, time
-        }
-    }
-
-    struct OCSessionTime: Codable {
-        let created: Double?
-        let updated: Double?
-    }
-
-    /// GET /session 列出全部会话
+    /// GET /api/session -> { data: [Session.Info], cursor }
     func sessions() async throws -> [OCSession] {
-        let request = try makeRequest("/session")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try ensureOK(response)
-        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            throw OCError.decoding
-        }
-        return arr.compactMap { dict -> OCSession? in
-            guard let id = dict["id"] as? String else { return nil }
-            return OCSession(
-                id: id,
-                title: dict["title"] as? String,
-                time: nil
-            )
-        }
+        let data = try await perform(try makeRequest("/api/session"))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        return arr.compactMap { parseSession($0) }
+            .sorted { $0.updated > $1.updated }
     }
 
-    /// POST /session 创建会话
-    func createSession() async throws -> OCSession {
-        var request = try makeRequest("/session", method: "POST")
-        request.httpBody = Data()
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try ensureOK(response)
-        guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let id = dict["id"] as? String else {
-            throw OCError.decoding
-        }
-        return OCSession(id: id, title: dict["title"] as? String, time: nil)
+    private func parseSession(_ dict: [String: Any]) -> OCSession? {
+        guard let id = dict["id"] as? String else { return nil }
+        let time = dict["time"] as? [String: Any] ?? [:]
+        let created = number(time["created"]) ?? 0
+        let updated = number(time["updated"]) ?? created
+        let model = dict["model"] as? [String: Any]
+        return OCSession(
+            id: id,
+            title: dict["title"] as? String,
+            created: created,
+            updated: updated,
+            modelID: model?["id"] as? String,
+            providerID: model?["providerID"] as? String
+        )
     }
 
-    /// DELETE /session/:id 删除会话
+    /// POST /api/session -> { data: Session.Info }
+    func createSession(title: String? = nil) async throws -> OCSession {
+        var body: [String: Any] = [:]
+        if let title, !title.isEmpty { body["title"] = title }
+        let data = try await perform(try makeRequest("/api/session", method: "POST", body: body))
+        let json = try dictionary(data)
+        guard let dict = json["data"] as? [String: Any], let session = parseSession(dict) else {
+            throw OCError.decoding
+        }
+        return session
+    }
+
+    /// DELETE /api/session/{id}
     func deleteSession(_ id: String) async throws {
-        let request = try makeRequest("/session/\(id)", method: "DELETE")
-        let (_, response) = try await URLSession.shared.data(for: request)
-        try ensureOK(response)
+        _ = try await perform(try makeRequest("/api/session/\(id)", method: "DELETE"))
+    }
+
+    /// 切换会话模型：POST /api/session/{id}/model { model: { id, providerID } }
+    func switchModel(sessionID: String, model: OCModel) async throws {
+        let body: [String: Any] = ["model": ["id": model.modelID, "providerID": model.providerID]]
+        _ = try await perform(try makeRequest("/api/session/\(sessionID)/model", method: "POST", body: body))
     }
 
     // MARK: - 消息
 
-    struct OCMessage: Identifiable, Hashable {
-        let id: String
-        let role: String
-        let content: String
-        let isStreaming: Bool
-        let error: Bool
-        let completed: Bool
-
-        var displayName: String {
-            role == "user" ? "我" : "Assistant"
-        }
-    }
-
-    /// GET /session/:id/message 获取会话消息列表（按时间升序）。
-    /// limit 为最近消息数（不含历史），before 为从某条消息之前继续分页（均可选）。
-    func messages(sessionID: String, limit: Int? = nil, before: String? = nil) async throws -> [OCMessage] {
-        var query: [URLQueryItem] = []
-        if let limit { query.append(URLQueryItem(name: "limit", value: String(limit))) }
-        if let before { query.append(URLQueryItem(name: "before", value: before)) }
-        let request = try makeRequest("/session/\(sessionID)/message", query: query)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try ensureOK(response)
-        return parseMessages(data)
-    }
-
-    private func parseMessages(_ data: Data) -> [OCMessage] {
-        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            return []
-        }
-        var result: [OCMessage] = []
-        for item in arr {
-            guard let info = item["info"] as? [String: Any] else { continue }
-            guard let mid = info["id"] as? String else { continue }
-            let role = info["role"] as? String ?? "assistant"
-            let completed = (info["time"] as? [String: Any])?["completed"] != nil
-            let isError = info["error"] != nil
-            let parts = parseParts(item["parts"] as? [[String: Any]] ?? [])
-            result.append(OCMessage(
-                id: mid,
-                role: role,
-                content: parts.joined(),
-                isStreaming: false,
-                error: isError,
-                completed: completed
-            ))
-        }
-        return result
-    }
-
-    // MARK: - 发送消息
-
-    struct OCSendResult {
-        let message: OCMessage
-        let parts: [String]
-    }
-
-    /// 发送消息（即时对话，兼容新旧版本服务器）。
-    /// 使用 POST /session/:id/message 并流式读取响应：
-    /// - 现代版本返回单段 JSON {info, parts}
-    /// - 旧版本返回 SSE 事件流（text/event-stream），逐块回调文本
-    /// 两种都支持，保证一定能收到回复。
-    func sendMessage(
-        sessionID: String,
-        text: String,
-        model: OCModel? = nil,
-        onText: @escaping (String) -> Void = { _ in }
-    ) async throws -> OCSendResult {
-        var request = try makeRequest("/session/\(sessionID)/message", method: "POST")
-        var body: [String: Any] = [
-            "parts": [
-                ["type": "text", "text": text]
-            ]
+    /// GET /api/session/{id}/message?limit=&order=desc&cursor=
+    func messages(sessionID: String, limit: Int = 30, cursor: String? = nil) async throws -> OCMessagesPage {
+        var query: [URLQueryItem] = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "order", value: "desc")
         ]
-        if let model {
-            body["model"] = ["providerID": model.providerID, "modelID": model.modelID]
+        if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
+        let data = try await perform(try makeRequest("/api/session/\(sessionID)/message", query: query))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        var msgs: [OCMessage] = []
+        for item in arr {
+            if let m = parseMessage(item) { msgs.append(m) }
         }
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 600
-
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        try ensureOK(response)
-
-        var accumulated = ""
-        var fullJSON = ""
-
-        do {
-            for try await line in bytes.lines {
-                let t = line.trimmingCharacters(in: .whitespaces)
-                if t.hasPrefix("data:") {
-                    let payload = t.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                    guard !payload.isEmpty, payload != "[DONE]" else { continue }
-                    switch parseEventText(payload) {
-                    case .some(let result):
-                        if !result.full.isEmpty {
-                            accumulated = result.full
-                            onText(accumulated)
-                        } else if !result.delta.isEmpty {
-                            accumulated += result.delta
-                            onText(accumulated)
-                        }
-                    case .none:
-                        break
-                    }
-                } else if t.hasPrefix("{") {
-                    // 可能是不带 data: 前缀的整段 JSON（单段响应），累积拼接供整体解析
-                    if accumulated.isEmpty {
-                        fullJSON += t
-                    }
-                }
-            }
-        } catch {}
-
-        // 1) 若已通过 SSE 拿到文本，直接返回
-        if !accumulated.isEmpty {
-            let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: accumulated, isStreaming: false, error: false, completed: true)
-            return OCSendResult(message: msg, parts: [accumulated])
-        }
-
-        // 2) 否则尝试整体 JSON {info, parts}
-        if let json = try? JSONSerialization.jsonObject(with: Data(fullJSON.utf8)) as? [String: Any] {
-            if let info = json["info"] as? [String: Any],
-               let mid = info["id"] as? String {
-                let role = info["role"] as? String ?? "assistant"
-                let isError = info["error"] != nil
-                let parts = parseParts(json["parts"] as? [[String: Any]] ?? [])
-                let text = parts.joined()
-                let msg = OCMessage(id: mid, role: role, content: text, isStreaming: false, error: isError, completed: true)
-                return OCSendResult(message: msg, parts: parts)
-            }
-        }
-
-        // 3) 尝试整段 SSE 文本兜底
-        let sseText = mergeSSELines(fullJSON)
-        if !sseText.isEmpty {
-            let msg = OCMessage(id: UUID().uuidString, role: "assistant", content: sseText, isStreaming: false, error: false, completed: true)
-            return OCSendResult(message: msg, parts: [sseText])
-        }
-
-        throw OCError.decoding
+        msgs.sort { $0.created < $1.created }
+        let cursorDict = json["cursor"] as? [String: Any] ?? [:]
+        let older = cursorDict["previous"] as? String
+        return OCMessagesPage(messages: msgs, olderCursor: older)
     }
 
-    /// 解析 opencode 事件帧 JSON，提取 assistant 文本。
-    /// -.full: 该 part 的完整文本（覆盖），-.delta: 增量文本（追加）。
-    private func parseEventText(_ payload: String) -> (full: String, delta: String)? {
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] else {
+    private func parseMessage(_ dict: [String: Any]) -> OCMessage? {
+        guard let id = dict["id"] as? String, let type = dict["type"] as? String else { return nil }
+        let time = dict["time"] as? [String: Any] ?? [:]
+        let created = number(time["created"]) ?? 0
+        switch type {
+        case "user":
+            let payload = dict["payload"] as? [String: Any] ?? [:]
+            let text = (payload["text"] as? String) ?? (dict["text"] as? String) ?? ""
+            return OCMessage(id: id, kind: .user, text: text, reasoning: "", tools: [], created: created, isStreaming: false, isError: false)
+        case "assistant":
+            var text = ""
+            var reasoning = ""
+            var tools: [OCTool] = []
+            for item in dict["content"] as? [[String: Any]] ?? [] {
+                switch item["type"] as? String {
+                case "text":
+                    text += item["text"] as? String ?? ""
+                case "reasoning":
+                    reasoning += item["text"] as? String ?? ""
+                case "tool":
+                    if let tool = parseTool(item) { tools.append(tool) }
+                default:
+                    break
+                }
+            }
+            let error = dict["error"] as? [String: Any]
+            return OCMessage(
+                id: id,
+                kind: .assistant,
+                text: text,
+                reasoning: reasoning,
+                tools: tools,
+                created: created,
+                isStreaming: time["completed"] == nil,
+                isError: error != nil,
+                errorText: error?["message"] as? String
+            )
+        default:
+            // idle / system / compaction 等不参与聊天气泡
             return nil
         }
-        // 新版事件：{ type: "message.part.updated", properties: { part: {…}, delta } }
-        if let properties = obj["properties"] as? [String: Any] {
-            if let part = properties["part"] as? [String: Any] {
-                let type = part["type"] as? String ?? ""
-                if type == "text", let pt = part["text"] as? String, !pt.isEmpty {
-                    return (pt, "")
-                }
-                if type == "error", let error = part["error"] as? String {
-                    return ("[错误] \(error)", "")
-                }
-            }
-            if let delta = properties["delta"] as? String, !delta.isEmpty {
-                return ("", delta)
-            }
-            return nil
-        }
-        // 旧格式：顶层 part/text/content
-        if let part = obj["part"] as? [String: Any], part["type"] as? String == "text", let pt = part["text"] as? String, !pt.isEmpty {
-            return (pt, "")
-        }
-        if let t = obj["text"] as? String, !t.isEmpty { return (t, "") }
-        if let content = obj["content"] as? String, !content.isEmpty { return (content, "") }
-        return nil
     }
 
-    private func mergeSSELines(_ raw: String) -> String {
-        var out = ""
-        for line in raw.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            guard t.hasPrefix("data:") else { continue }
-            let payload = t.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            guard !payload.isEmpty, payload != "[DONE]" else { continue }
-            if let json = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] {
-                if let properties = json["properties"] as? [String: Any],
-                   let part = properties["part"] as? [String: Any],
-                   let pt = part["text"] as? String {
-                    out = pt
-                } else if let pt = json["text"] as? String {
-                    out += pt
-                } else if let pc = json["content"] as? String {
-                    out += pc
+    private func parseTool(_ dict: [String: Any]) -> OCTool? {
+        guard let id = dict["id"] as? String else { return nil }
+        let name = dict["name"] as? String ?? "tool"
+        let state = dict["state"] as? [String: Any] ?? [:]
+        let status = state["status"] as? String ?? "completed"
+        var inputText = ""
+        if let input = state["input"], JSONSerialization.isValidJSONObject(input),
+           let d = try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys]),
+           let s = String(data: d, encoding: .utf8) {
+            inputText = s
+        }
+        var output = ""
+        for item in state["content"] as? [[String: Any]] ?? [] {
+            if let t = item["text"] as? String { output += t }
+            else if let t = item["value"] as? String { output += t }
+        }
+        let error = (state["error"] as? [String: Any])?["message"] as? String
+        return OCTool(id: id, name: name, status: status, input: inputText, output: output, error: error)
+    }
+
+    /// POST /api/session/{id}/prompt { text } -> { data: userMessage }
+    @discardableResult
+    func sendPrompt(sessionID: String, text: String) async throws -> String? {
+        let body: [String: Any] = ["text": text]
+        let data = try await perform(try makeRequest("/api/session/\(sessionID)/prompt", method: "POST", body: body))
+        let json = try? dictionary(data)
+        let message = json?["data"] as? [String: Any]
+        return message?["id"] as? String
+    }
+
+    /// POST /api/session/{id}/interrupt
+    func interrupt(sessionID: String) async throws {
+        _ = try await perform(try makeRequest("/api/session/\(sessionID)/interrupt", method: "POST", body: [:]))
+    }
+
+    // MARK: - 权限（授权确认）
+
+    /// GET /api/permission/request -> { location, data: [Permission.Request] }
+    func permissions() async throws -> [OCPermission] {
+        let data = try await perform(try makeRequest("/api/permission/request"))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        return arr.compactMap { item in
+            guard let id = item["id"] as? String, let sessionID = item["sessionID"] as? String else { return nil }
+            return OCPermission(
+                id: id,
+                sessionID: sessionID,
+                action: item["action"] as? String ?? "操作",
+                resources: item["resources"] as? [String] ?? [],
+                message: item["message"] as? String
+            )
+        }
+    }
+
+    /// POST /api/session/{sid}/permission/{rid}/reply { decision: once|always|reject }
+    func replyPermission(_ request: OCPermission, decision: String, message: String? = nil) async throws {
+        var body: [String: Any] = ["decision": decision]
+        if let message, !message.isEmpty { body["message"] = message }
+        _ = try await perform(try makeRequest("/api/session/\(request.sessionID)/permission/\(request.id)/reply", method: "POST", body: body))
+    }
+
+    // MARK: - 表单（选择对话框）
+
+    /// GET /api/session/{id}/form -> { data: [Form.Info] }
+    func forms(sessionID: String) async throws -> [OCForm] {
+        let data = try await perform(try makeRequest("/api/session/\(sessionID)/form"))
+        let json = try dictionary(data)
+        let arr = json["data"] as? [[String: Any]] ?? []
+        return arr.compactMap { item in
+            guard let id = item["id"] as? String else { return nil }
+            let fields = (item["fields"] as? [[String: Any]] ?? []).compactMap { parseField($0) }
+            return OCForm(
+                id: id,
+                sessionID: item["sessionID"] as? String ?? sessionID,
+                title: item["title"] as? String ?? "请选择",
+                fields: fields
+            )
+        }
+    }
+
+    private func parseField(_ dict: [String: Any]) -> OCFormField? {
+        guard let key = dict["key"] as? String, let type = dict["type"] as? String else { return nil }
+        let opts = (dict["options"] as? [[String: Any]] ?? []).map { o in
+            OCOption(
+                value: o["value"] as? String ?? "",
+                label: o["label"] as? String ?? (o["value"] as? String ?? ""),
+                detail: o["description"] as? String ?? ""
+            )
+        }
+        return OCFormField(
+            key: key,
+            title: dict["title"] as? String ?? key,
+            description: dict["description"] as? String ?? "",
+            type: type,
+            required: dict["required"] as? Bool ?? false,
+            hidden: dict["hidden"] as? Bool ?? false,
+            custom: dict["custom"] as? Bool ?? false,
+            conditional: (dict["when"] as? [[String: Any]])?.isEmpty == false,
+            options: opts,
+            defaultValue: dict["default"],
+            url: dict["url"] as? String ?? ""
+        )
+    }
+
+    /// POST /api/session/{sid}/form/{fid}/reply { answer: { key: value } }
+    func replyForm(_ form: OCForm, answer: [String: Any]) async throws {
+        let body: [String: Any] = ["answer": answer]
+        _ = try await perform(try makeRequest("/api/session/\(form.sessionID)/form/\(form.id)/reply", method: "POST", body: body))
+    }
+}
+
+// MARK: - 事件流
+
+struct OCEvent {
+    let id: String
+    let type: String
+    let data: [String: Any]
+}
+
+/// `GET /api/event` 的 SSE 长连接（自动重连）。
+final class OCEventStream: ObservableObject {
+    private var task: Task<Void, Never>?
+
+    func start(onEvent: @escaping (OCEvent) -> Void, onState: @escaping (Bool) -> Void = { _ in }) {
+        stop()
+        guard let url = URL(string: ServerConfig.shared.normalizedBaseURL + "/api/event") else { return }
+        let auth = ServerConfig.shared.authHeader
+        task = Task.detached(priority: .background) {
+            var attempt = 0
+            while !Task.isCancelled {
+                do {
+                    var request = URLRequest(url: url)
+                    request.timeoutInterval = 3600
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+                    if let auth { request.setValue(auth, forHTTPHeaderField: "Authorization") }
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                        if http.statusCode == 401 { onState(false); return }
+                        throw URLError(.badServerResponse)
+                    }
+                    attempt = 0
+                    onState(true)
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        guard line.hasPrefix("data:") else { continue }
+                        let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        guard !payload.isEmpty,
+                              let raw = payload.data(using: .utf8),
+                              let obj = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { continue }
+                        let event = OCEvent(
+                            id: obj["id"] as? String ?? UUID().uuidString,
+                            type: obj["type"] as? String ?? "",
+                            data: obj["data"] as? [String: Any] ?? [:]
+                        )
+                        onEvent(event)
+                    }
+                } catch {
+                    // 断线（含反代 60s 超时）后自动重连
                 }
+                onState(false)
+                if Task.isCancelled { break }
+                attempt += 1
+                let delay = min(Double(attempt) * 1.5, 8.0)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
-        return out
     }
 
-    private func parseParts(_ parts: [[String: Any]]) -> [String] {
-        var out: [String] = []
-        for part in parts {
-            let type = part["type"] as? String ?? ""
-            if type == "text", let t = part["text"] as? String {
-                out.append(t)
-            }
-        }
-        return out
-    }
-
-    private func ensureOK(_ response: URLResponse) throws {
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            throw OCError.http(http.statusCode)
-        }
+    func stop() {
+        task?.cancel()
+        task = nil
     }
 }

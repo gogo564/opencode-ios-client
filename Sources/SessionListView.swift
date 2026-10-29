@@ -60,6 +60,7 @@ struct SessionListView: View {
                     .onDelete(perform: deleteSessions)
                 }
                 .listStyle(.plain)
+                .refreshable { await store.refresh() }
             }
         }
         .onAppear {
@@ -91,13 +92,24 @@ struct SessionRow: View {
                 Text(session.title ?? "未命名会话")
                     .font(.system(size: 15, weight: .medium))
                     .lineLimit(1)
-                Text(session.id)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(relativeTime)
+                    Text("·")
+                    Text(session.id)
+                        .lineLimit(1)
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
             }
             Spacer()
         }
         .padding(.vertical, 2)
+    }
+
+    private var relativeTime: String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: session.updatedDate, relativeTo: Date())
     }
 }

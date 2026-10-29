@@ -1,17 +1,20 @@
 # OpenCodeClient
 
-一个 iOS 15+ 的原生 OpenCode 服务器客户端。通过 opencode server HTTP API 与你的 OpenCode（AI 编码助手）服务器对话，支持流式聊天、会话管理、多服务器地址。
+一个 iOS 15+ 的原生 OpenCode 服务器客户端。适配 OpenCode V2（2.0.x）的 `/api` 接口，通过 `GET /api/event` 事件流接收流式回复。
 
 ## 功能
 
-- 💬 流式对话（基于 opencode server HTTP API）
-- 📋 会话列表 / 新建 / 删除会话
-- 🖥 服务器地址 + 用户名/密码（Basic Auth）设置
+- 💬 流式对话（`POST /api/session/{id}/prompt` + `/api/event` SSE）
+- 📋 会话列表 / 新建 / 删除，历史消息分页加载
+- 🔀 会话模型切换
+- 🔐 权限确认弹窗（允许一次 / 始终允许 / 拒绝）
+- 📝 表单弹窗（单选、多选、开关、数字、自定义输入）
+- 🛠 工具调用展示（输入/输出/错误可折叠）
 - 📱 iOS 15+ 兼容，SwiftUI 原生实现
 
 ## 使用
 
-1. 打开 App，进入设置，填写你的 OpenCode 服务器地址、用户名和密码（Basic Auth）
+1. 打开 App，进入设置，填写 OpenCode 服务器地址和密码（Basic Auth 用户名固定为 `opencode`）
 2. 点击"测试连接"验证
 3. 回到会话列表，新建会话并开始对话
 
