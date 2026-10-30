@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 
 /// 聊天页可能弹出的交互
 enum ChatSheet: Identifiable {
@@ -210,6 +211,12 @@ struct ChatView: View {
             }
             .onChange(of: streaming?.text) { _ in
                 withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                // 键盘弹起后列表可视高度变小，把最后的内容顶到输入框上方
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    scrollToBottom(proxy)
+                }
             }
         }
     }
