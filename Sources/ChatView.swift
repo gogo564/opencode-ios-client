@@ -212,20 +212,29 @@ struct ChatView: View {
             .onChange(of: streaming?.text) { _ in
                 withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
             }
-            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-                // 键盘弹起后列表可视高度变小，把最后的内容顶到输入框上方
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    scrollToBottom(proxy)
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+                // 键盘弹起后列表可视高度变小，把最后的内容顶到输入框上方。
+                // 延时取系统键盘动画时长，动画结束后一次性定位，避免叠加延迟
+                let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+                DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+                    scrollToBottom(proxy, animated: false)
                 }
             }
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        if streaming != nil {
-            withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
-        } else if let last = messages.last {
-            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        let action: () -> Void = {
+            if streaming != nil {
+                proxy.scrollTo("streaming", anchor: .bottom)
+            } else if let last = messages.last {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+        }
+        if animated {
+            withAnimation { action() }
+        } else {
+            action()
         }
     }
 
