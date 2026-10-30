@@ -44,5 +44,11 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>需要访问局域网内的 OpenCode 服务器以对话</string>
+	<key>NSCameraUsageDescription</key>
+	<string>需要使用相机拍摄照片并发送给助手</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>需要访问相册以选择图片发送给助手</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>需要保存图片到相册</string>
 </dict>
 </plist>

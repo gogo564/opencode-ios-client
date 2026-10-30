@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 enum OCError: LocalizedError {
     case invalidURL
@@ -138,6 +139,7 @@ final class OpenCodeClient {
         var isStreaming: Bool
         var isError: Bool
         var errorText: String? = nil
+        var images: [UIImage] = []
 
         var displayName: String { kind == .user ? "我" : "Assistant" }
     }
@@ -309,7 +311,16 @@ final class OpenCodeClient {
         case "user":
             let payload = dict["payload"] as? [String: Any] ?? [:]
             let text = (payload["text"] as? String) ?? (dict["text"] as? String) ?? ""
-            return OCMessage(id: id, kind: .user, text: text, reasoning: "", tools: [], created: created, isStreaming: false, isError: false)
+            let files = (dict["files"] as? [[String: Any]]) ?? (payload["files"] as? [[String: Any]]) ?? []
+            var images: [UIImage] = []
+            for file in files {
+                guard let mime = file["mime"] as? String, mime.hasPrefix("image/"),
+                      let base64 = file["data"] as? String,
+                      let data = Data(base64Encoded: base64),
+                      let image = UIImage(data: data) else { continue }
+                images.append(image)
+            }
+            return OCMessage(id: id, kind: .user, text: text, reasoning: "", tools: [], created: created, isStreaming: false, isError: false, images: images)
         case "assistant":
             var text = ""
             var reasoning = ""

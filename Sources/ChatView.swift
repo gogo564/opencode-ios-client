@@ -238,6 +238,7 @@ struct ChatView: View {
 
                 TextField("输入消息…", text: $input)
                     .textFieldStyle(.roundedBorder)
+                    .frame(height: 34)
                     .onSubmit { send(delivery: nil) }
 
                 if isStreaming {
@@ -275,6 +276,7 @@ struct ChatView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
+        .fixedSize(horizontal: false, vertical: true)
         .background(Color(uiColor: .systemBackground))
     }
 
@@ -570,6 +572,7 @@ struct ChatView: View {
         let files = attachments.map { OpenCodeClient.OCFileAttachment(uri: $0.uri, name: $0.name) }
         guard !text.isEmpty || !files.isEmpty else { return }
 
+        let previews = attachments.compactMap { $0.preview }
         input = ""
         attachments = []
         errorMessage = nil
@@ -578,7 +581,7 @@ struct ChatView: View {
         let localID = "local-\(UUID().uuidString)"
 
         if !isQueue {
-            messages.append(OpenCodeClient.OCMessage(id: localID, kind: .user, text: displayText, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false))
+            messages.append(OpenCodeClient.OCMessage(id: localID, kind: .user, text: displayText, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false, images: previews))
             isStreaming = true
         }
 
@@ -594,7 +597,7 @@ struct ChatView: View {
                 } else if let serverID {
                     await MainActor.run {
                         if let index = messages.firstIndex(where: { $0.id == localID }) {
-                            messages[index] = OpenCodeClient.OCMessage(id: serverID, kind: .user, text: displayText, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false)
+                            messages[index] = OpenCodeClient.OCMessage(id: serverID, kind: .user, text: displayText, reasoning: "", tools: [], created: nowMs(), isStreaming: false, isError: false, images: previews)
                         }
                     }
                 }
@@ -679,6 +682,22 @@ struct MessageBubble: View {
 
                 if !message.reasoning.isEmpty {
                     ReasoningBubble(text: message.reasoning)
+                }
+
+                if !message.images.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(Array(message.images.enumerated()), id: \.offset) { item in
+                                Image(uiImage: item.element)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 150, height: 150)
+                                    .clipped()
+                                    .cornerRadius(12)
+                            }
+                        }
+                    }
+                    .frame(width: 300, height: 150, alignment: message.kind == .user ? .trailing : .leading)
                 }
 
                 if !message.text.isEmpty {
