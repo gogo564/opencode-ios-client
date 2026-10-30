@@ -30,6 +30,12 @@ struct PendingAttachment: Identifiable {
     let preview: UIImage?
 }
 
+/// 点击缩略图后全屏查看
+struct PreviewImage: Identifiable {
+    let id = UUID()
+    let image: UIImage
+}
+
 /// 单会话聊天界面（V2：prompt + /api/event 事件流 + 权限/表单弹窗）。
 struct ChatView: View {
     let session: OpenCodeClient.OCSession
@@ -51,6 +57,7 @@ struct ChatView: View {
     @State private var dismissedFormIDs: Set<String> = []
     @State private var queued: [OpenCodeClient.OCInboxMessage] = []
     @State private var attachments: [PendingAttachment] = []
+    @State private var previewImage: PreviewImage?
     @State private var title: String
     @State private var pollTask: Task<Void, Never>?
 
@@ -67,8 +74,9 @@ struct ChatView: View {
         VStack(spacing: 0) {
             statusBar
             messageList
-            Divider()
-            inputBar
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    inputBar
+                }
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
@@ -91,6 +99,9 @@ struct ChatView: View {
         }
         .sheet(item: $activeSheet) { sheet in
             sheetView(sheet)
+        }
+        .fullScreenCover(item: $previewImage) { item in
+            FullImageView(image: item.image)
         }
     }
 
@@ -180,11 +191,17 @@ struct ChatView: View {
                     }
 
                     ForEach(messages) { msg in
-                        MessageBubble(message: msg).id(msg.id)
+                        MessageBubble(message: msg) { image in
+                            previewImage = PreviewImage(image: image)
+                        }
+                        .id(msg.id)
                     }
 
                     if let streaming {
-                        MessageBubble(message: streaming).id("streaming")
+                        MessageBubble(message: streaming) { image in
+                            previewImage = PreviewImage(image: image)
+                        }
+                        .id("streaming")
                     }
                 }
                 .padding(.horizontal)
@@ -237,8 +254,13 @@ struct ChatView: View {
                 }
 
                 TextField("输入消息…", text: $input)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
+                    .padding(.horizontal, 10)
                     .frame(height: 34)
+                    .background(
+                        RoundedRectangle(cornerRadius: 17)
+                            .stroke(Color(uiColor: .separator), lineWidth: 1)
+                    )
                     .onSubmit { send(delivery: nil) }
 
                 if isStreaming {
@@ -363,13 +385,44 @@ struct ChatView: View {
         }
         pollTask?.cancel()
         pollTask = Task {
+            var tick = 0
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if Task.isCancelled { break }
-                await refreshQueued()
-                await refreshInteractions()
+                tick += 1
+                await pollLive()
+                if tick % 3 == 0 {
+                    await refreshQueued()
+                    await refreshInteractions()
+                }
             }
         }
+    }
+
+    /// 流式期间轮询最新消息：经反代后 SSE 不一定实时，靠轮询保证能看到工作状态
+    private func pollLive() async {
+        guard isStreaming else { return }
+        do {
+            let page = try await client.messages(sessionID: session.id, limit: 12)
+            await MainActor.run {
+                let existing = Set(messages.map { $0.id })
+                let newOnes = page.messages.filter { !existing.contains($0.id) }
+                if !newOnes.isEmpty {
+                    let incomingUserTexts = Set(newOnes.filter { $0.kind == .user }.map { $0.text })
+                    messages.removeAll { $0.id.hasPrefix("local-") && incomingUserTexts.contains($0.text) }
+                    messages.append(contentsOf: newOnes)
+                }
+                for msg in page.messages where msg.isStreaming {
+                    if let index = messages.firstIndex(where: { $0.id == msg.id }) {
+                        messages[index] = msg
+                    }
+                }
+                streaming = nil
+                if let last = page.messages.last, last.kind == .assistant, !last.isStreaming {
+                    isStreaming = false
+                }
+            }
+        } catch {}
     }
 
     private func loadModels() async {
@@ -397,6 +450,9 @@ struct ChatView: View {
                 olderCursor = page.olderCursor
                 errorMessage = nil
                 isLoading = false
+                if let last = page.messages.last, last.kind == .assistant, last.isStreaming {
+                    isStreaming = true
+                }
             }
         } catch {
             await MainActor.run {
@@ -521,27 +577,8 @@ struct ChatView: View {
         switch event.type {
         case "session.text.started":
             guard sid == session.id else { return }
-            let mid = event.data["assistantMessageID"] as? String ?? "streaming"
-            if streaming?.id != mid {
-                streaming = OpenCodeClient.OCMessage(id: mid, kind: .assistant, text: "", reasoning: "", tools: [], created: nowMs(), isStreaming: true, isError: false)
-            }
             isStreaming = true
-
-        case "session.text.delta":
-            guard sid == session.id, let delta = event.data["delta"] as? String else { return }
-            let mid = event.data["assistantMessageID"] as? String ?? "streaming"
-            var msg = streaming ?? OpenCodeClient.OCMessage(id: mid, kind: .assistant, text: "", reasoning: "", tools: [], created: nowMs(), isStreaming: true, isError: false)
-            msg.text += delta
-            streaming = msg
-            isStreaming = true
-
-        case "session.text.ended":
-            guard sid == session.id else { return }
-            if let full = event.data["text"] as? String {
-                var msg = streaming ?? OpenCodeClient.OCMessage(id: event.data["assistantMessageID"] as? String ?? "streaming", kind: .assistant, text: "", reasoning: "", tools: [], created: nowMs(), isStreaming: true, isError: false)
-                msg.text = full
-                streaming = msg
-            }
+            Task { await pollLive() }
 
         case "session.execution.started":
             if sid == session.id { isStreaming = true }
@@ -671,6 +708,7 @@ struct ChatView: View {
 
 struct MessageBubble: View {
     let message: OpenCodeClient.OCMessage
+    var onTapImage: ((UIImage) -> Void)? = nil
 
     var body: some View {
         HStack {
@@ -688,12 +726,17 @@ struct MessageBubble: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
                             ForEach(Array(message.images.enumerated()), id: \.offset) { item in
-                                Image(uiImage: item.element)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 150, height: 150)
-                                    .clipped()
-                                    .cornerRadius(12)
+                                Button {
+                                    onTapImage?(item.element)
+                                } label: {
+                                    Image(uiImage: item.element)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 150, height: 150)
+                                        .clipped()
+                                        .cornerRadius(12)
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -710,9 +753,14 @@ struct MessageBubble: View {
                                 .fill(message.kind == .user ? Color.accentColor.opacity(0.15) : Color(uiColor: .secondarySystemBackground))
                         )
                 } else if message.isStreaming {
-                    Text("…")
-                        .padding(12)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(Color(uiColor: .secondarySystemBackground)))
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("正在处理…")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 14).fill(Color(uiColor: .secondarySystemBackground)))
                 }
 
                 ForEach(message.tools) { tool in

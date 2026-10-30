@@ -552,3 +552,24 @@ struct SavedPermissionsView: View {
         }
     }
 }
+
+// MARK: - 图片大图
+
+struct FullImageView: View {
+    let image: UIImage
+    @Environment(\.presentationMode) private var presentationMode
+
+    var body: some View {
+        ZStack {
+            Color.black.edgesIgnoringSafeArea(.all)
+
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .padding(8)
+        }
+        .onTapGesture {
+            presentationMode.wrappedValue.dismiss()
+        }
+    }
+}
