@@ -74,9 +74,7 @@ struct ChatView: View {
         VStack(spacing: 0) {
             statusBar
             messageList
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    inputBar
-                }
+            inputBar
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
