@@ -573,3 +573,54 @@ struct FullImageView: View {
         }
     }
 }
+
+// MARK: - 输入框（UITextField 包装，避免 SwiftUI TextField 聚焦时高度变化）
+
+struct InputTextField: UIViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+    var onSubmit: () -> Void
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.placeholder = placeholder
+        field.borderStyle = .none
+        field.font = UIFont.preferredFont(forTextStyle: .body)
+        field.returnKeyType = .send
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .editingChanged)
+        field.delegate = context.coordinator
+        return field
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        if field.text != text {
+            field.text = text
+        }
+        context.coordinator.onSubmit = onSubmit
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var onSubmit: () -> Void
+        private var parent: InputTextField
+
+        init(_ parent: InputTextField) {
+            self.parent = parent
+            self.onSubmit = parent.onSubmit
+        }
+
+        @objc func changed(_ field: UITextField) {
+            parent.text = field.text ?? ""
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            onSubmit()
+            return false
+        }
+    }
+}

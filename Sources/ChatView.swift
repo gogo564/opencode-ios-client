@@ -253,15 +253,15 @@ struct ChatView: View {
                         .font(.system(size: 26))
                 }
 
-                TextField("输入消息…", text: $input)
-                    .textFieldStyle(.plain)
-                    .padding(.horizontal, 10)
-                    .frame(height: 34)
-                    .background(
-                        RoundedRectangle(cornerRadius: 17)
-                            .stroke(Color(uiColor: .separator), lineWidth: 1)
-                    )
-                    .onSubmit { send(delivery: nil) }
+                InputTextField(text: $input, placeholder: "输入消息…") {
+                    send(delivery: nil)
+                }
+                .frame(height: 34)
+                .padding(.horizontal, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 17)
+                        .stroke(Color(uiColor: .separator), lineWidth: 1)
+                )
 
                 if isStreaming {
                     Menu {
@@ -298,8 +298,16 @@ struct ChatView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(height: inputBarHeight)
         .background(Color(uiColor: .systemBackground))
+    }
+
+    /// 输入栏固定高度：基础一行 + 附件行 + 排队行，避免聚焦/键盘时被拉伸
+    private var inputBarHeight: CGFloat {
+        var height: CGFloat = 54
+        if !attachments.isEmpty { height += 42 }
+        if !queued.isEmpty { height += 42 + CGFloat(queued.count) * 18 }
+        return height
     }
 
     private var canSend: Bool {
@@ -333,6 +341,7 @@ struct ChatView: View {
             }
         }
         .padding(8)
+        .frame(height: 34 + CGFloat(queued.count) * 18)
         .background(Color(uiColor: .secondarySystemBackground))
         .cornerRadius(8)
     }
@@ -366,6 +375,7 @@ struct ChatView: View {
                 }
             }
         }
+        .frame(height: 34)
     }
 
     // MARK: - 启动与加载
